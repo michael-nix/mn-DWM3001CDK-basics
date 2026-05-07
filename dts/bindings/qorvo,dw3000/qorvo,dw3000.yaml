@@ -1,0 +1,233 @@
+description: Qorvo DW3000
+
+compatible: "qorvo,dw3000"
+
+include: spi-device.yaml
+
+properties:
+  reset-gpios:
+    type: phandle-array
+    required: true
+    description: DW_RST, reset pin (active low)
+
+  irq-gpios:
+    type: phandle-array
+    required: true
+    description: DW_IRQ, interrupt pin (active high)
+
+  spi-min-frequency:
+    type: int
+    required: true
+    default: 2000000
+    description: DW3000 slow rate for board initialization, in Hz.
+
+  chan:
+    type: int
+    required: true
+    default: 5
+    enum:
+      - 5 # 6489.6 MHz PRF
+      - 9 # 7987.2 MHz PRF
+    description: |
+      The chan parameter sets the UWB channel number, (defining the centre 
+      frequency and bandwidth). The supported channels are 5 (6489.6 MHz PRF)
+      and 9 (7987.2 MHz PRF).
+
+  txcode:
+    type: int
+    required: true
+    default: 9
+    enum:
+      - 3 # 16 MHz PRF
+      - 4 # 16 MHz PRF
+      - 9 # 64 MHz PRF
+      - 10 # 64 MHz PRF
+      - 11 # 64 MHz PRF
+      - 12 # 64 MHz PRF
+      - 25 # SCP
+      - 26 # SCP
+      - 27 # SCP
+      - 29 # SCP
+      - 29 # SCP
+    description: |
+      The txCode and rxCode parameters select the preamble codes to use in the
+      transmitter and the receiver; these are generally both set to the same 
+      values.  For correct operation of the device, the selected preamble code
+      should follow the rules of IEEE 802.15.4-2015 UWB with respect to which
+      codes are allowed in the particular channel and PRF configuration, this
+      is shown in Table 2 in the DW3XXX Software API Guide. The code will also
+      define the PRF (pulse repetition frequency) used.
+
+  rxcode:
+    type: int
+    required: true
+    default: 9
+    enum:
+      - 3 # 16 MHz PRF
+      - 4 # 16 MHz PRF
+      - 9 # 64 MHz PRF
+      - 10 # 64 MHz PRF
+      - 11 # 64 MHz PRF
+      - 12 # 64 MHz PRF
+      - 25 # SCP
+      - 26 # SCP
+      - 27 # SCP
+      - 29 # SCP
+      - 29 # SCP
+    description: |
+      See txCode above.  Generally set the same as txCode.
+
+  sfdtype:
+    type: int
+    required: true
+    default: 1
+    enum:
+      - 0 # IEEE 8-bit ternary
+      - 1 # Qorvo proprietary 8-bit
+      - 2 # Qorvo proprietary 16-bit
+      - 3 # IEEE 8-bit binary (4z)
+      - 8 # IEEE, and Qorvo 8-bit are length 8
+      - 16 # Qorvo 16-bit is length 16
+    description: |
+      The sfdType parameter enables the use of one of 4 possible SFD (Start 
+      Frame Delimiter) sequences. The supported values are: 0 - short IEEE 
+      8-bit standard, 1 - DW 8-bit, 2 - DW 16-bit, 3 - 4z BPRF) DW 8 and 16 
+      bit sequences, which Decawave has found to be more robust than that 
+      specified in the IEEE 802.15.4 standard, give improved performance.
+
+  datarate:
+    type: int
+    required: true
+    default: 0
+    enum:
+      - 0 # 850 kbps
+      - 1 # 6.8 Mbps
+      - 2 # No data (SP3 packet format)
+    description: |
+      The dataRate parameter specifies the data rate to be one of 850kbps or
+      6800kbps, via symbolic definitions DWT_BR_850K and DWT_BR_6M8.
+
+  txpreamblength:
+    type: int
+    required: true
+    default: 1024
+    enum:
+      - 16
+      - 32
+      - 64 # standard
+      - 128
+      - 256
+      - 512
+      - 1024 # standard
+      - 1536
+      - 2048
+      - 4096 # standard
+    description: |
+      The txPreambLength parameter specifies preamble length which has a range
+      of values given by symbolic definitions: DWT_PLEN_4096, DWT_PLEN_2048,
+      DWT_PLEN_1536, DWT_PLEN_1024, DWT_PLEN_512, DWT_PLEN_256,
+      DWT_PLEN_128, DWT_PLEN_64, DWT_PLEN_32. Table 3 in the DW3XXX Software
+      API Guide gives recommended preamble sequence lengths to use depending 
+      on the data rate. 
+
+  rxpac:
+    type: int
+    required: true
+    default: 1
+    enum:
+      - 0 # PAC 8 (txPreambLength >= 64, data rate 6.81 Mbps)
+      - 1 # PAC 16 (txPreambLength >= 128, data rate 850 kbps)
+      - 2 # PAC 32 (txPreambLength == 512)
+      - 3 # PAC 4 (txPreambLength == 32, data rate 6.81 Mbps)
+    description: |
+      The rxPAC parameter specifies the Preamble Acquisition Chunk size to use.
+      Allowed values are DWT_PAC8 (0), DWT_PAC16 (1), DWT_PAC32 (2) or 
+      DWT_PAC4 (3).  Table 4 in the DW3XXX Software API Guide gives the 
+      recommended PAC size to use in the receiver depending on the preamble 
+      length being used in the transmitter. PAC size is specified in preamble 
+      symbols, which are approximately 1 µs each.
+
+  phrmode:
+    type: int
+    required: true
+    default: 0
+    enum:
+      - 0 # standard PHR mode (frame length of 5 - 127)
+      - 1 # extended PHR mode (frame length of 5 - 1023)
+    description: |
+      The phrMode parameter selects between either the standard or extended PHR
+      mode is set, either DWT_PHRMODE_STD (0) for standard length frames 5 to
+      127 octets long or non-standard DWT_PHRMODE_EXT (1) allowing frames of 
+      length 5 to 1023 octets long.
+
+  phrrate:
+    type: int
+    required: true
+    default: 0
+    enum:
+      - 0 # standard PHR rate, 850 kbps
+      - 1 # PHR sent at data rate, 6.8 Mbps
+    description: |
+      The phrRate parameter selects between either using the standard 850 kbps
+      rate for PHR symbols or using a higher rate; same as the data rate.
+
+  sfdto:
+    type: int
+    required: false
+    default: 1017 # default txPreambLength + 1 + sfdType length - rxPAC
+    description: |
+      The sfdTO parameter sets the SFD timeout value. The purpose of the SFD
+      detection timeout is to recover from the occasional false preamble 
+      detection events that may occur. By default, this value is 
+      4096 + 64 + 1 symbols, which is just longer the longest possible preamble 
+      and SFD sequence. This is the maximum value that is sensible. When it is 
+      known that a shorter preamble is being used then the value can be reduced 
+      appropriately. The function does not allow a value of zero. (If a 0 value 
+      is selected the default value of 4161 symbols (DWT_SFDTOC_DEF) will be 
+      used). The recommended value is:
+        preamble length + 1 + SFD length \- PAC size.
+
+  stsmode:
+    type: int
+    required: true
+    default: 0
+    enum:
+      - 0 # STS is off (SP0)
+      - 1 # STS mode 1 (SP1)
+      - 2 # STS mode 2 (SP2)
+      - 3 # STS with no data (SP3)
+      - 8 # enable super deterministic codes
+      - 11
+    description: |
+      The stsMode parameter sets one of four possible STS modes: no STS, STS
+      before PHR, STS after data, or no data mode.
+
+  stslength:
+    type: int
+    required: true
+    default: 7
+    enum:
+      - 1 # DWT_STS_LEN_16
+      - 3 # DWT_STS_LEN_32
+      - 7 # DWT_STS_LEN_64
+      - 15 # DWT_STS_LEN_128
+      - 31 # DWT_STS_LEN_256
+      - 63 # DWT_STS_LEN_512
+      - 127 # DWT_STS_LEN_1024
+      - 255 # DWT_STS_LEN_2048
+    description: |
+      The stsLength parameter specifies STS length. The API supports the 
+      lengths defined by the dwt_sts_lengths_e. 
+
+  pdoamode:
+    type: int
+    required: true
+    default: 0
+    enum:
+      - 0 # PDOA off
+      - 1 # PDOA mode 1
+      - 3 # PDOA mode 3
+    description: |
+      The pdoaMode parameter configures one of three possible PDOA modes: no
+      PDOA, mode 1 (PDOA is calculated between Ipatov POA and STS POA), mode
+      3 (PDOA is calculated between two STS blocks
