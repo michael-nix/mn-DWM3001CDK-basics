@@ -30,8 +30,8 @@
 // This was the fastest I could get it:
 #define DW_TRANSMIT_TIME_DELAY_UUS (2250)
 
-// Speed of light...
-#define SPEED_OF_LIGHT (299702547)
+// Speed of light... (m / s)
+#define SPEED_OF_LIGHT (299702547.0)
 
 LOG_MODULE_REGISTER(uwb_test, LOG_LEVEL_INF);
 
@@ -225,24 +225,35 @@ void dw3000_irq_handler(
     dwt_isr();
 }
 
+enum dw3000_msg_type
+{
+    DW3000_INIT_TX = 0xC5,
+    DW3000_RESP_TX = 0xC6,
+};
+
 enum dw3000_event_type
 {
-    DW3000_EVENT_RX_OK,
-    DW3000_EVENT_RX_ERR,
+    DW3000_EVENT_RX_OK_RESP, // received 0xC5; message from init
+    DW3000_EVENT_RX_OK_INIT, // received 0xC6; message from resp
+    DW3000_EVENT_RX_ERR,     // rx error, timeout; or, other error
 };
 
 // Structure passed from ISR to main loop
-struct dw3000_rx_data
+struct dw3000_msg_data
 {
+    uint8_t msg_type;
+    uint8_t seq_num;
     uint64_t device_id;
-    uint64_t rx_timestamp;
     uint64_t reply_time;
     enum dw3000_event_type event_type;
 };
 
+#define DW_MSG_DATA_TXRX_LEN                                                   \
+    (sizeof(struct dw3000_msg_data) - sizeof(enum dw3000_event_type))
+
 // Message queue for managing DW3000 RX-OK events.
 K_MSGQ_DEFINE(
-    dw_event_queue, sizeof(struct dw3000_rx_data), DW_MAX_NUM_EVENTS, 4);
+    dw_event_queue, sizeof(struct dw3000_msg_data), DW_MAX_NUM_EVENTS, 4);
 
 /*
     Callback function for the DW3000 driver to call when a RX good frame event
@@ -252,16 +263,23 @@ void dw3000_rxok_callback(const dwt_cb_data_t* data)
 {
     LOG_INF("RX OK callback triggered, reading data from DW3000.");
 
-    uint8_t rx_buffer[16] = {0};
-    dwt_readrxdata(rx_buffer, sizeof(rx_buffer), 2);
+    struct dw3000_msg_data rx_message = {0};
+    dwt_readrxdata((uint8_t*)&rx_message, DW_MSG_DATA_TXRX_LEN, 0);
 
-    struct dw3000_rx_data rx_message = {0};
-    rx_message.event_type = DW3000_EVENT_RX_OK;
-    memcpy(&rx_message.device_id, rx_buffer, sizeof(rx_message.device_id));
-    memcpy(
-        &rx_message.reply_time, &rx_buffer[8], sizeof(rx_message.reply_time));
+    switch ((enum dw3000_msg_type)rx_message.msg_type)
+    {
+    // If a responder successfully receives a transmission from an initiator:
+    case DW3000_INIT_TX:
+        rx_message.event_type = DW3000_EVENT_RX_OK_RESP;
 
-    dwt_readrxtimestamp((uint8_t*)&rx_message.rx_timestamp, DWT_COMPAT_NONE);
+        break;
+
+    // If an initiator successfully receives a transmission from a responder:
+    case DW3000_RESP_TX:
+        rx_message.event_type = DW3000_EVENT_RX_OK_INIT;
+
+        break;
+    }
 
     if (0 != k_msgq_put(&dw_event_queue, &rx_message, K_NO_WAIT))
     {
@@ -273,7 +291,7 @@ void dw3000_rxerr_callback(const dwt_cb_data_t* data)
 {
     LOG_ERR("Error receiving DW3000 frame.");
 
-    struct dw3000_rx_data rx_message = {0};
+    struct dw3000_msg_data rx_message = {0};
     rx_message.event_type = DW3000_EVENT_RX_ERR;
 
     if (0 != k_msgq_put(&dw_event_queue, &rx_message, K_NO_WAIT))
@@ -479,9 +497,10 @@ int main(void)
 
     // IEEE standard message type for a blink is 0xC5, followed by sequence
     // number, then eight byte device ID:
-    uint8_t tx_data[18] = {0};
-    tx_data[0] = 0xC5;
-    memcpy(&tx_data[2], &device_id, sizeof(device_id));
+    struct dw3000_msg_data tx_message = {0};
+    tx_message.msg_type = INITIATOR_DEVICE_ID == device_id ? DW3000_INIT_TX :
+                                                             DW3000_RESP_TX;
+    tx_message.device_id = device_id;
 
     LOG_INF("");
 
@@ -491,7 +510,7 @@ int main(void)
 
         while (true)
         {
-            struct dw3000_rx_data rx_message = {0};
+            struct dw3000_msg_data rx_message = {0};
             if (0 != k_msgq_get(&dw_event_queue, &rx_message, K_FOREVER))
             {
                 LOG_WRN("DW event queue purged.");
@@ -503,13 +522,16 @@ int main(void)
             switch (rx_message.event_type)
             {
             case DW3000_EVENT_RX_ERR:
-                LOG_ERR(
-                    "DW3000 failed to receive a message, resetting receiver.");
+                LOG_ERR("DW3000 responder failed to receive a message, "
+                        "resetting receiver.");
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
                 continue;
             default:
             }
+
+            uint64_t rx_timestamp = 0;
+            dwt_readrxtimestamp((uint8_t*)&rx_timestamp, DWT_COMPAT_NONE);
 
             // transmit time only uses the top 31 bits of the 40 bit timestamps,
             // which is why you see it converted to a uint32 by shifting down
@@ -517,21 +539,19 @@ int main(void)
             // way the actual time spent between reception and transmission is
             // accurate to when the actual message is sent:
             uint32_t transmit_time =
-                (rx_message.rx_timestamp +
+                (rx_timestamp +
                     (DW_TRANSMIT_TIME_DELAY_UUS * UUS_TO_DWT_TIME)) >>
                 8;
 
             dwt_setdelayedtrxtime(transmit_time);
 
-            rx_message.reply_time =
+            tx_message.reply_time =
                 (((uint64_t)(transmit_time & 0xFFFFFFFEUL)) << 8) +
-                DW_ANTENNA_DELAY - rx_message.rx_timestamp;
+                DW_ANTENNA_DELAY - rx_timestamp;
 
-            memcpy(&tx_data[10], &rx_message.reply_time,
-                sizeof(rx_message.reply_time));
-
-            dwt_writetxdata(sizeof(tx_data), tx_data, 0);
-            dwt_writetxfctrl(sizeof(tx_data) + 2, 0, 1);
+            dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)&tx_message, 0);
+            dwt_writetxfctrl(
+                DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
 
             int32_t error =
                 dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
@@ -549,7 +569,7 @@ int main(void)
             dwt_readtxtimestamp((uint8_t*)&tx_timestamp);
 
             LOG_INF("DW3000 rx event device_id = 0x%llx", rx_message.device_id);
-            LOG_INF("DW3000 rx timestamp = %llu", rx_message.rx_timestamp);
+            LOG_INF("DW3000 rx timestamp = %llu", rx_timestamp);
             LOG_INF("Sending message, device_id = 0x%llx", device_id);
             LOG_INF("Transmit time: %llu", (uint64_t)transmit_time << 8);
             LOG_INF("Reply time: %llu\n", rx_message.reply_time);
@@ -563,11 +583,11 @@ int main(void)
         LOG_INF("Sending message, device_id = 0x%llx", device_id);
         dwt_forcetrxoff();
 
-        dwt_writetxdata(sizeof(tx_data), tx_data, 0);
-        dwt_writetxfctrl(sizeof(tx_data) + 2, 0, 1); // + 2 for CRC bytes
+        dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)&tx_message, 0);
+        dwt_writetxfctrl(DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
         dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 
-        struct dw3000_rx_data rx_message = {0};
+        struct dw3000_msg_data rx_message = {0};
         int error = k_msgq_get(&dw_event_queue, &rx_message, K_MSEC(100));
         if (0 != error)
         {
@@ -578,16 +598,31 @@ int main(void)
             continue;
         }
 
-        uint64_t tx_timestamp = {0};
+        switch (rx_message.event_type)
+        {
+        case DW3000_EVENT_RX_ERR:
+            LOG_ERR("DW3000 initiator failed to receive a message, resetting "
+                    "receiver.");
+
+            k_sleep(K_MSEC(900));
+
+            continue;
+        default:
+        }
+
+        uint64_t tx_timestamp = 0;
         dwt_readtxtimestamp((uint8_t*)&tx_timestamp);
+
+        uint64_t rx_timestamp = 0;
+        dwt_readrxtimestamp((uint8_t*)&rx_timestamp, DWT_COMPAT_NONE);
 
         LOG_INF("TX timestamp from raw: %llu\n", tx_timestamp);
 
         LOG_INF("DW3000 rx event device_id = 0x%llx", rx_message.device_id);
-        LOG_INF("DW3000 rx timestamp = %llu\n", rx_message.rx_timestamp);
+        LOG_INF("DW3000 rx timestamp = %llu\n", rx_timestamp);
 
         double offset = ((float)dwt_readclockoffset()) / (uint32_t)(1 << 26);
-        double range = (rx_message.rx_timestamp - tx_timestamp -
+        double range = (rx_timestamp - tx_timestamp -
                            rx_message.reply_time * (1.0 - offset)) /
                        2.0 * DWT_TIME_UNITS * SPEED_OF_LIGHT;
 
