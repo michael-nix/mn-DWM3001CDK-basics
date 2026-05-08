@@ -27,7 +27,10 @@
 //  factor. 1 uus = 512 / 499.2 µs and 1 µs = 499.2 * 128 dtu.
 #define UUS_TO_DWT_TIME (63898)
 
-// This was the fastest I could get it:
+// Tunable parameter to determine when to send the responder message upon
+// receiving a message from the initiator.  If you get warnings about
+// transmissions getting canceled, make this number bigger.  This was the
+// smallest I could get it (in UWB microseconds):
 #define DW_TRANSMIT_TIME_DELAY_UUS (2250)
 
 // Speed of light... (m / s)
@@ -294,6 +297,18 @@ void dw3000_reset(void)
     k_msleep(2);
 }
 
+/*
+    This function does a lot and can be cleaned up, but it contains everything
+    needed to set up the DW3000 for use:
+     - Initializes GPIO and SPI peripherals, based on the device tree & overlay,
+     - Sets up interrupts and their callbacks,
+     - Probes the DW3000, initializing the driver,
+     - Initializes and then configures the DW3000 based on configuration
+       settings in the device tree overlay,
+     - Determines the full device ID,
+     - Configures transmission spectrum and antenna delay,
+     - Turns on the LEDs (they flash when it sends a message).
+*/
 int dw3000_initialize(uint64_t* device_id)
 {
     if (!spi_is_ready_dt(dw3000_spi))
@@ -462,105 +477,102 @@ int dw3000_initialize(uint64_t* device_id)
     return 0;
 }
 
-int main(void)
+/*
+    The responder receives messages from the intitiator, schedules a time to
+    reply, and then sends a reply message.  Included in the reply message is the
+    time it took from receiving the message to the time it was sent (based on
+    delayed transmit).
+*/
+void manage_responder_messages(struct dw3000_msg_data* responder_message)
 {
-    uint64_t device_id = 0;
-    if (dw3000_initialize(&device_id) != 0)
-    {
-        LOG_ERR("HW init failed");
+    responder_message->msg_type = DW3000_RESP_TX;
 
-        return -1;
-    }
-
-    // IEEE standard message type for a blink is 0xC5, followed by sequence
-    // number, then eight byte device ID:
-    struct dw3000_msg_data tx_message = {0};
-    tx_message.msg_type = INITIATOR_DEVICE_ID == device_id ? DW3000_INIT_TX :
-                                                             DW3000_RESP_TX;
-    tx_message.device_id = device_id;
-
-    LOG_INF("");
-
-    if (INITIATOR_DEVICE_ID != device_id)
-    {
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-        while (true)
-        {
-            struct dw3000_msg_data rx_message = {0};
-            if (0 != k_msgq_get(&dw_event_queue, &rx_message, K_FOREVER))
-            {
-                LOG_WRN("DW event queue purged.");
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-                continue;
-            }
-
-            switch ((enum dw3000_msg_type)rx_message.msg_type)
-            {
-            case DW3000_RX_ERR:
-                LOG_ERR("DW3000 responder failed to receive a message, "
-                        "resetting receiver.");
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-                continue;
-            default:
-            }
-
-            uint64_t rx_timestamp = 0;
-            dwt_readrxtimestamp((uint8_t*)&rx_timestamp, DWT_COMPAT_NONE);
-
-            // transmit time only uses the top 31 bits of the 40 bit timestamps,
-            // which is why you see it converted to a uint32 by shifting down
-            // eight bits, then convert it back and lopping off the LSB.  This
-            // way the actual time spent between reception and transmission is
-            // accurate to when the actual message is sent:
-            uint32_t transmit_time =
-                (rx_timestamp +
-                    (DW_TRANSMIT_TIME_DELAY_UUS * UUS_TO_DWT_TIME)) >>
-                8;
-
-            dwt_setdelayedtrxtime(transmit_time);
-
-            tx_message.reply_time =
-                (((uint64_t)(transmit_time & 0xFFFFFFFEUL)) << 8) +
-                DW_ANTENNA_DELAY - rx_timestamp;
-
-            dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)&tx_message, 0);
-            dwt_writetxfctrl(
-                DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
-
-            int32_t error =
-                dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
-            if (DWT_SUCCESS != error)
-            {
-                LOG_WRN("DW3000 transmission was cancelled, transmit time has "
-                        "passed!\n");
-
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-                continue;
-            }
-
-            uint64_t tx_timestamp = {0};
-            dwt_readtxtimestamp((uint8_t*)&tx_timestamp);
-
-            LOG_INF("DW3000 rx event device_id = 0x%llx", rx_message.device_id);
-            LOG_INF("DW3000 rx timestamp = %llu", rx_timestamp);
-            LOG_INF("Sending message, device_id = 0x%llx", device_id);
-            LOG_INF("Transmit time: %llu", (uint64_t)transmit_time << 8);
-            LOG_INF("Reply time: %llu\n", rx_message.reply_time);
-        }
-
-        return 0;
-    }
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
     while (true)
     {
-        LOG_INF("Sending message, device_id = 0x%llx", device_id);
+        struct dw3000_msg_data rx_message = {0};
+        if (0 != k_msgq_get(&dw_event_queue, &rx_message, K_FOREVER))
+        {
+            LOG_WRN("DW event queue purged.");
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+            continue;
+        }
+
+        switch ((enum dw3000_msg_type)rx_message.msg_type)
+        {
+        case DW3000_RX_ERR:
+            LOG_ERR("DW3000 responder failed to receive a message, "
+                    "resetting receiver.");
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+            continue;
+        default:
+        }
+
+        uint64_t rx_timestamp = 0;
+        dwt_readrxtimestamp((uint8_t*)&rx_timestamp, DWT_COMPAT_NONE);
+
+        // transmit time only uses the top 31 bits of the 40 bit timestamps,
+        // which is why you see it converted to a uint32 by shifting down
+        // eight bits, then convert it back and lopping off the LSB.  This
+        // way the actual time spent between reception and transmission is
+        // accurate to when the actual message is sent:
+        uint32_t transmit_time =
+            (rx_timestamp + (DW_TRANSMIT_TIME_DELAY_UUS * UUS_TO_DWT_TIME)) >>
+            8;
+
+        dwt_setdelayedtrxtime(transmit_time);
+
+        responder_message->reply_time =
+            (((uint64_t)(transmit_time & 0xFFFFFFFEUL)) << 8) +
+            DW_ANTENNA_DELAY - rx_timestamp;
+
+        dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)responder_message, 0);
+        dwt_writetxfctrl(DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
+
+        int32_t error =
+            dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+        if (DWT_SUCCESS != error)
+        {
+            LOG_WRN("DW3000 transmission was cancelled, transmit time has "
+                    "passed!\n");
+
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+            continue;
+        }
+
+        uint64_t tx_timestamp = {0};
+        dwt_readtxtimestamp((uint8_t*)&tx_timestamp);
+
+        LOG_INF("DW3000 rx event device_id = 0x%llx", rx_message.device_id);
+        LOG_INF("DW3000 rx timestamp = %llu", rx_timestamp);
+        LOG_INF("Sending message, device_id = 0x%llx",
+            responder_message->device_id);
+        LOG_INF("Transmit time: %llu", (uint64_t)transmit_time << 8);
+        LOG_INF("Reply time: %llu\n", responder_message->reply_time);
+    }
+}
+
+/*
+    The initiator sends a message every second, and waits for a reply from the
+    responder.  If a message is received in time, it uses the original message
+    transmit time, the responder's reply receive time, and the responder's time
+    to reply to calculate a distance between the initiator and responder.
+*/
+void manage_initiator_messages(struct dw3000_msg_data* initiator_message)
+{
+    initiator_message->msg_type = DW3000_INIT_TX;
+
+    while (true)
+    {
+        LOG_INF("Sending message, device_id = 0x%llx",
+            initiator_message->device_id);
         dwt_forcetrxoff();
 
-        dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)&tx_message, 0);
+        dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)initiator_message, 0);
         dwt_writetxfctrl(DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
         dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 
@@ -568,7 +580,7 @@ int main(void)
         int error = k_msgq_get(&dw_event_queue, &rx_message, K_MSEC(100));
         if (0 != error)
         {
-            LOG_INF("Expected DW3000 rx event timeout!\n");
+            LOG_WRN("Didn't receive expected DW3000 rx event in time!\n");
 
             k_sleep(K_MSEC(900));
 
@@ -581,7 +593,7 @@ int main(void)
             LOG_ERR("DW3000 initiator failed to receive a message, resetting "
                     "receiver.");
 
-            k_sleep(K_MSEC(900));
+            k_sleep(K_SECONDS(1));
 
             continue;
         default:
@@ -606,6 +618,33 @@ int main(void)
         LOG_INF("Calculated range: %f m\n", range);
 
         k_sleep(K_SECONDS(1));
+    }
+}
+
+int main(void)
+{
+    uint64_t device_id = 0;
+    if (dw3000_initialize(&device_id) != 0)
+    {
+        LOG_ERR("HW init failed");
+
+        return -1;
+    }
+
+    // IEEE standard message type for a blink is 0xC5, followed by sequence
+    // number, then eight byte device ID:
+    struct dw3000_msg_data tx_message = {0};
+    tx_message.device_id = device_id;
+
+    LOG_INF("");
+
+    if (INITIATOR_DEVICE_ID == device_id)
+    {
+        manage_initiator_messages(&tx_message);
+    }
+    else
+    {
+        manage_responder_messages(&tx_message);
     }
 
     return 0;
