@@ -229,13 +229,7 @@ enum dw3000_msg_type
 {
     DW3000_INIT_TX = 0xC5,
     DW3000_RESP_TX = 0xC6,
-};
-
-enum dw3000_event_type
-{
-    DW3000_EVENT_RX_OK_RESP, // received 0xC5; message from init
-    DW3000_EVENT_RX_OK_INIT, // received 0xC6; message from resp
-    DW3000_EVENT_RX_ERR,     // rx error, timeout; or, other error
+    DW3000_RX_ERR,
 };
 
 // Structure passed from ISR to main loop
@@ -245,11 +239,9 @@ struct dw3000_msg_data
     uint8_t seq_num;
     uint64_t device_id;
     uint64_t reply_time;
-    enum dw3000_event_type event_type;
 };
 
-#define DW_MSG_DATA_TXRX_LEN                                                   \
-    (sizeof(struct dw3000_msg_data) - sizeof(enum dw3000_event_type))
+#define DW_MSG_DATA_TXRX_LEN (sizeof(struct dw3000_msg_data))
 
 // Message queue for managing DW3000 RX-OK events.
 K_MSGQ_DEFINE(
@@ -266,21 +258,6 @@ void dw3000_rxok_callback(const dwt_cb_data_t* data)
     struct dw3000_msg_data rx_message = {0};
     dwt_readrxdata((uint8_t*)&rx_message, DW_MSG_DATA_TXRX_LEN, 0);
 
-    switch ((enum dw3000_msg_type)rx_message.msg_type)
-    {
-    // If a responder successfully receives a transmission from an initiator:
-    case DW3000_INIT_TX:
-        rx_message.event_type = DW3000_EVENT_RX_OK_RESP;
-
-        break;
-
-    // If an initiator successfully receives a transmission from a responder:
-    case DW3000_RESP_TX:
-        rx_message.event_type = DW3000_EVENT_RX_OK_INIT;
-
-        break;
-    }
-
     if (0 != k_msgq_put(&dw_event_queue, &rx_message, K_NO_WAIT))
     {
         LOG_WRN("DW event queue full, dropping message.");
@@ -292,7 +269,7 @@ void dw3000_rxerr_callback(const dwt_cb_data_t* data)
     LOG_ERR("Error receiving DW3000 frame.");
 
     struct dw3000_msg_data rx_message = {0};
-    rx_message.event_type = DW3000_EVENT_RX_ERR;
+    rx_message.msg_type = DW3000_RX_ERR;
 
     if (0 != k_msgq_put(&dw_event_queue, &rx_message, K_NO_WAIT))
     {
@@ -519,9 +496,9 @@ int main(void)
                 continue;
             }
 
-            switch (rx_message.event_type)
+            switch ((enum dw3000_msg_type)rx_message.msg_type)
             {
-            case DW3000_EVENT_RX_ERR:
+            case DW3000_RX_ERR:
                 LOG_ERR("DW3000 responder failed to receive a message, "
                         "resetting receiver.");
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
@@ -598,9 +575,9 @@ int main(void)
             continue;
         }
 
-        switch (rx_message.event_type)
+        switch ((enum dw3000_msg_type)rx_message.msg_type)
         {
-        case DW3000_EVENT_RX_ERR:
+        case DW3000_RX_ERR:
             LOG_ERR("DW3000 initiator failed to receive a message, resetting "
                     "receiver.");
 
