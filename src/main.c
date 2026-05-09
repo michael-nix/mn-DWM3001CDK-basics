@@ -236,7 +236,7 @@ enum dw3000_msg_type
 };
 
 // Structure passed from ISR to main loop
-struct dw3000_msg_data
+struct __packed dw3000_msg_data
 {
     uint8_t msg_type;
     uint8_t seq_num;
@@ -267,6 +267,10 @@ void dw3000_rxok_callback(const dwt_cb_data_t* data)
     }
 }
 
+/*
+    Callback function for the DW3000 driver to call when any error event
+    is triggered.
+*/
 void dw3000_rxerr_callback(const dwt_cb_data_t* data)
 {
     LOG_ERR("Error receiving DW3000 frame.");
@@ -289,10 +293,14 @@ static dwt_callbacks_s dw3000_irq_callbacks = {
 
 // ----------------------------------------------------------------------------
 
+/*
+    Resets the DW3000 by toggling the reset pin.
+*/
 void dw3000_reset(void)
 {
     gpio_pin_set_dt(&dw3000_reset_pin, 1);
     k_msleep(2);
+
     gpio_pin_set_dt(&dw3000_reset_pin, 0);
     k_msleep(2);
 }
@@ -384,6 +392,7 @@ int dw3000_initialize(uint64_t* device_id)
 
     LOG_INF("DW3000 initialized.");
 
+    // Grab the config from the Devicetree overlay:
     dw3000_config.chan = DT_PROP(DW3000_NODE, chan);
     dw3000_config.dataRate = DT_PROP(DW3000_NODE, datarate);
     dw3000_config.pdoaMode = DT_PROP(DW3000_NODE, pdoamode);
@@ -396,6 +405,12 @@ int dw3000_initialize(uint64_t* device_id)
     dw3000_config.txCode = DT_PROP(DW3000_NODE, txcode);
     dw3000_config.txPreambLength = DT_PROP(DW3000_NODE, txpreamblength);
     dw3000_config.sfdType = DT_PROP(DW3000_NODE, sfdtype);
+
+    // The SFD timeout is determined by the number of bits needed for a number
+    // of parameters:
+    // - Preamble length,
+    // - SFD length,
+    // - PAC length.
 
     uint16_t sfd_length = 8;
     switch (dw3000_config.sfdType)
