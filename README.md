@@ -1,9 +1,15 @@
 # mn-DWM3001CDK-basics
 Basic demonstration of the DWM3001C using the development kit, DWM3001CDK.
 
+**Michael Nix**, Toronto, Canada, 2026
+
+---
+
+## Intro
+
 I finally got around to playing with the Decawave Module 3001C Development Kits (DWM3001CDKs) that I bought a few years ago.  I bounced off of putting it together back then because I wanted to try to use the tools recommended by the hardware manufacturer (in this case, the nRF Connect extension for VS Code), Nordic, as there's an nRF52833 in the DWM3001C that you use to... use... the UWB transceiver.  This means using Zephyr OS (as opposed to bare metal), since that's the default, and also the only thing thought leaders on LinkedIn talk about.  However, since Zephyr stays true to the OSS model of being openly hostile to users, particularly new users, it took me a while to get up to speed.
 
-Which is why I put this together.  UWB stuff is hard enough, we don't need to fight blank documentation pages for critical peripherals (looking at you, SPI), or sift through novellas about build systems in place of a checklist of how to use the API.  Anyway, my goals for this repo are to:
+Which is why I put this together.  UWB stuff is hard enough, we don't need to fight blank documentation pages for critical peripherals (looking at you, SPI), or sift through novellas about build systems in place of a checklist of how to get started using the fundamentals or basic concepts of the API.  Anyway, my goals for this repo are to:
 
 1. Keep things as simple as possible,
 2. Keep things as obvious as possible,
@@ -11,7 +17,7 @@ Which is why I put this together.  UWB stuff is hard enough, we don't need to fi
 4. Make the use of the DW3000 as easy to understand as possible,
 5. Document things as best as I can.
 
-The latest Qorvo docs that I could find are in the `.\docs` directory.
+The latest Qorvo docs that I could find are in the `.\docs` directory.  The single-sided two-way range (SS-TWR) code is adapted from some examples I found from the original Decawave SDK I had laying around from way back when.
 
 To that end, I have built Devicetree bindings for the DW3000 (in `dts\bindings\qorvo,dw3000\worvo,dw3000.yaml`) that define the necessary pins and all config options with documentation from the API guide; an overlay for the decawave_dwm3001cdk Devicetree specification (`.\decawave_dwm3001cdk_nrf52833.overlay`) that includes the DW3000 bindings--including ok default values for the firmware config (slower speeds for longer range); one source file, a big chunk of which is documentation; and a main function demo that builds a hardcoded initiator that sends a message once per second, receiving a response from a responder and calculating a single-sided two-way range.
 
@@ -32,7 +38,7 @@ I also use a straight copy / paste of the Qorvo DW3 QM33 SDK 1.1.1 that I got of
 
 ## Actually Using the Code
 
-In order to actually *use* this code, you will need two DWM3001CDKs.  These two devices will conduct a single-sided two-way range (SS-TWR) measurement.  One of them will be the initiator, sending the first message of an SS-TWR once per second.  The other will be a responder, responding to that message.
+In order to actually *use* this code, you will need two DWM3001CDKs.  These two devices will conduct single-sided two-way range measurements.  One of them will be the initiator, sending the first message of an SS-TWR once per second.  The other will be a responder, responding to that message.  The initiator will receive the response, and calculate a range.
 
 If you plug the J-Link port (the "bottom" USB port, farthest from the UWB antenna, labelled J9), it should get auto-detected by the nRF extension.  You can then hit the build button, and once its complete, hit the flash button.  You can then connect to the device, and it should automatically open up another terminal and start printing out the logs.  
 
