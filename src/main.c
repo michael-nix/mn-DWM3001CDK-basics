@@ -565,7 +565,7 @@ void manage_initiator_messages(struct dw3000_msg_data* initiator_message)
         return;
 
     case DW3000_RX_ERR:
-        LOG_ERR("DW3000 initiator failed to receive a message!");
+        LOG_ERR("DW3000 initiator failed to receive a message!\n");
 
         return;
     default:
@@ -596,7 +596,6 @@ void manage_initiator_messages(struct dw3000_msg_data* initiator_message)
 int main(void)
 {
     k_event_init(&dw3000_events);
-    k_timer_init(&dw3000_tx_timer, dw3000_tx_timer_expires, NULL);
 
     uint64_t device_id = 0;
     if (dw3000_initialize(&device_id) != 0)
@@ -616,6 +615,7 @@ int main(void)
     if (INITIATOR_DEVICE_ID == device_id)
     {
         tx_message.msg_type = DW3000_INIT_TX_TYPE;
+        k_timer_init(&dw3000_tx_timer, dw3000_tx_timer_expires, NULL);
         k_timer_start(&dw3000_tx_timer, K_SECONDS(1), K_SECONDS(1));
     }
     else
