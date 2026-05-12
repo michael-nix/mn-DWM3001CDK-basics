@@ -17,9 +17,6 @@
 // Maximum time to wait for the DW3000 to enter IDLE_RC mode after reset:
 #define DW_MAX_WAIT_UNTIL_IDLE_MS 100
 
-// Maximum number of events in the dw_event_queue, tracking DW3000 RX events:
-#define DW_MAX_NUM_EVENTS 4
-
 // default antenna delay, from DW3000 User Manual:
 #define DW_ANTENNA_DELAY 0x4015
 
@@ -30,8 +27,9 @@
 // Tunable parameter to determine when to send the responder message upon
 // receiving a message from the initiator.  If you get warnings about
 // transmissions getting canceled, make this number bigger.  This was the
-// smallest I could get it (in UWB microseconds):
-#define DW_TRANSMIT_TIME_DELAY_UUS (2250)
+// smallest I could get it for my given transmission parameters, preamble, etc.
+// (in UWB microseconds):
+#define DW_TRANSMIT_TIME_DELAY_UUS (1900)
 
 // Speed of light... (m / s)
 #define SPEED_OF_LIGHT (299702547.0)
@@ -230,12 +228,12 @@ void dw3000_irq_handler(
 
 enum dw3000_msg_type
 {
-    DW3000_INIT_TX = 0xC5,
-    DW3000_RESP_TX = 0xC6,
-    DW3000_RX_ERR,
+    DW3000_INIT_TX_TYPE = 0xC5,
+    DW3000_RESP_TX_TYPE = 0xC6,
 };
 
-// Structure passed from ISR to main loop
+// IEEE standard message type for a blink is 0xC5, followed by sequence
+// number, then eight byte device ID:
 struct __packed dw3000_msg_data
 {
     uint8_t msg_type;
@@ -246,9 +244,22 @@ struct __packed dw3000_msg_data
 
 #define DW_MSG_DATA_TXRX_LEN (sizeof(struct dw3000_msg_data))
 
-// Message queue for managing DW3000 RX-OK events.
-K_MSGQ_DEFINE(
-    dw_event_queue, sizeof(struct dw3000_msg_data), DW_MAX_NUM_EVENTS, 4);
+struct k_event dw3000_events = {0};
+struct k_timer dw3000_tx_timer = {0};
+
+enum dw3000_event_type
+{
+    DW3000_TIMEOUT = 0,
+    DW3000_RX_OK = BIT(0),
+    DW3000_RX_ERR = BIT(1),
+    DW3000_TX_START = BIT(2),
+    DW3000_TX_DONE = BIT(3),
+};
+
+void dw3000_tx_timer_expires(struct k_timer* timer)
+{
+    k_event_post(&dw3000_events, DW3000_TX_START);
+}
 
 /*
     Callback function for the DW3000 driver to call when a RX good frame event
@@ -256,15 +267,7 @@ K_MSGQ_DEFINE(
 */
 void dw3000_rxok_callback(const dwt_cb_data_t* data)
 {
-    LOG_INF("RX OK callback triggered, reading data from DW3000.");
-
-    struct dw3000_msg_data rx_message = {0};
-    dwt_readrxdata((uint8_t*)&rx_message, DW_MSG_DATA_TXRX_LEN, 0);
-
-    if (0 != k_msgq_put(&dw_event_queue, &rx_message, K_NO_WAIT))
-    {
-        LOG_WRN("DW event queue full, dropping message.");
-    }
+    k_event_post(&dw3000_events, DW3000_RX_OK);
 }
 
 /*
@@ -275,13 +278,12 @@ void dw3000_rxerr_callback(const dwt_cb_data_t* data)
 {
     LOG_ERR("Error receiving DW3000 frame.");
 
-    struct dw3000_msg_data rx_message = {0};
-    rx_message.msg_type = DW3000_RX_ERR;
+    k_event_post(&dw3000_events, DW3000_RX_ERR);
+}
 
-    if (0 != k_msgq_put(&dw_event_queue, &rx_message, K_NO_WAIT))
-    {
-        LOG_WRN("DW event queue full, dropping message.");
-    }
+void dw3000_txdone_callback(const dwt_cb_data_t* data)
+{
+    k_event_post(&dw3000_events, DW3000_TX_DONE);
 }
 
 static dwt_callbacks_s dw3000_irq_callbacks = {
@@ -289,6 +291,7 @@ static dwt_callbacks_s dw3000_irq_callbacks = {
     .cbRxTo = dw3000_rxerr_callback,
     .cbRxErr = dw3000_rxerr_callback,
     .devErr = dw3000_rxerr_callback,
+    .cbTxDone = dw3000_txdone_callback,
 };
 
 // ----------------------------------------------------------------------------
@@ -500,75 +503,41 @@ int dw3000_initialize(uint64_t* device_id)
 */
 void manage_responder_messages(struct dw3000_msg_data* responder_message)
 {
-    responder_message->msg_type = DW3000_RESP_TX;
 
-    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    uint64_t rx_timestamp = 0;
+    dwt_readrxtimestamp((uint8_t*)&rx_timestamp, DWT_COMPAT_NONE);
 
-    while (true)
+    // transmit time only uses the top 31 bits of the 40 bit timestamps,
+    // which is why you see it converted to a uint32 by shifting down
+    // eight bits, then convert it back and lopping off the LSB.  This
+    // way the actual time spent between reception and transmission is
+    // accurate to when the actual message is sent:
+    uint32_t transmit_time =
+        (rx_timestamp + (DW_TRANSMIT_TIME_DELAY_UUS * UUS_TO_DWT_TIME)) >> 8;
+
+    dwt_setdelayedtrxtime(transmit_time);
+
+    responder_message->reply_time =
+        (((uint64_t)(transmit_time & 0xFFFFFFFEUL)) << 8) + DW_ANTENNA_DELAY -
+        rx_timestamp;
+
+    dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)responder_message, 0);
+    dwt_writetxfctrl(DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
+
+    int32_t error = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+    if (DWT_SUCCESS != error)
     {
-        struct dw3000_msg_data rx_message = {0};
-        if (0 != k_msgq_get(&dw_event_queue, &rx_message, K_FOREVER))
-        {
-            LOG_WRN("DW event queue purged.");
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        LOG_WRN("DW3000 transmission was cancelled, transmit time has "
+                "passed!\n");
 
-            continue;
-        }
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
-        switch ((enum dw3000_msg_type)rx_message.msg_type)
-        {
-        case DW3000_RX_ERR:
-            LOG_ERR("DW3000 responder failed to receive a message, "
-                    "resetting receiver.");
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-            continue;
-        default:
-        }
-
-        uint64_t rx_timestamp = 0;
-        dwt_readrxtimestamp((uint8_t*)&rx_timestamp, DWT_COMPAT_NONE);
-
-        // transmit time only uses the top 31 bits of the 40 bit timestamps,
-        // which is why you see it converted to a uint32 by shifting down
-        // eight bits, then convert it back and lopping off the LSB.  This
-        // way the actual time spent between reception and transmission is
-        // accurate to when the actual message is sent:
-        uint32_t transmit_time =
-            (rx_timestamp + (DW_TRANSMIT_TIME_DELAY_UUS * UUS_TO_DWT_TIME)) >>
-            8;
-
-        dwt_setdelayedtrxtime(transmit_time);
-
-        responder_message->reply_time =
-            (((uint64_t)(transmit_time & 0xFFFFFFFEUL)) << 8) +
-            DW_ANTENNA_DELAY - rx_timestamp;
-
-        dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)responder_message, 0);
-        dwt_writetxfctrl(DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
-
-        int32_t error =
-            dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
-        if (DWT_SUCCESS != error)
-        {
-            LOG_WRN("DW3000 transmission was cancelled, transmit time has "
-                    "passed!\n");
-
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-            continue;
-        }
-
-        uint64_t tx_timestamp = {0};
-        dwt_readtxtimestamp((uint8_t*)&tx_timestamp);
-
-        LOG_INF("DW3000 rx event device_id = 0x%llx", rx_message.device_id);
-        LOG_INF("DW3000 rx timestamp = %llu", rx_timestamp);
-        LOG_INF("Sending message, device_id = 0x%llx",
-            responder_message->device_id);
-        LOG_INF("Transmit time: %llu", (uint64_t)transmit_time << 8);
-        LOG_INF("Reply time: %llu\n", responder_message->reply_time);
+        return;
     }
+
+    LOG_INF("DW3000 RX timestamp = %llu", rx_timestamp);
+    LOG_INF("Transmit time: %llu", (uint64_t)transmit_time << 8);
+    LOG_INF("Reply time: %llu\n", responder_message->reply_time);
 }
 
 /*
@@ -579,65 +548,56 @@ void manage_responder_messages(struct dw3000_msg_data* responder_message)
 */
 void manage_initiator_messages(struct dw3000_msg_data* initiator_message)
 {
-    initiator_message->msg_type = DW3000_INIT_TX;
+    LOG_INF("DW3000 TX event Device ID = 0x%llx", initiator_message->device_id);
+    dwt_forcetrxoff();
 
-    while (true)
+    dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)initiator_message, 0);
+    dwt_writetxfctrl(DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
+    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+
+    uint32_t event = k_event_wait(
+        &dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(100));
+    switch ((enum dw3000_event_type)event)
     {
-        LOG_INF("Sending message, device_id = 0x%llx",
-            initiator_message->device_id);
-        dwt_forcetrxoff();
+    case DW3000_TIMEOUT:
+        LOG_WRN("Didn't receive expected DW3000 RX event in time!\n");
 
-        dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)initiator_message, 0);
-        dwt_writetxfctrl(DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
-        dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+        return;
 
-        struct dw3000_msg_data rx_message = {0};
-        int error = k_msgq_get(&dw_event_queue, &rx_message, K_MSEC(100));
-        if (0 != error)
-        {
-            LOG_WRN("Didn't receive expected DW3000 rx event in time!\n");
+    case DW3000_RX_ERR:
+        LOG_ERR("DW3000 initiator failed to receive a message!");
 
-            k_sleep(K_MSEC(900));
-
-            continue;
-        }
-
-        switch ((enum dw3000_msg_type)rx_message.msg_type)
-        {
-        case DW3000_RX_ERR:
-            LOG_ERR("DW3000 initiator failed to receive a message, resetting "
-                    "receiver.");
-
-            k_sleep(K_SECONDS(1));
-
-            continue;
-        default:
-        }
-
-        uint64_t tx_timestamp = 0;
-        dwt_readtxtimestamp((uint8_t*)&tx_timestamp);
-
-        uint64_t rx_timestamp = 0;
-        dwt_readrxtimestamp((uint8_t*)&rx_timestamp, DWT_COMPAT_NONE);
-
-        LOG_INF("TX timestamp from raw: %llu\n", tx_timestamp);
-
-        LOG_INF("DW3000 rx event device_id = 0x%llx", rx_message.device_id);
-        LOG_INF("DW3000 rx timestamp = %llu\n", rx_timestamp);
-
-        double offset = ((float)dwt_readclockoffset()) / (uint32_t)(1 << 26);
-        double range = (rx_timestamp - tx_timestamp -
-                           rx_message.reply_time * (1.0 - offset)) /
-                       2.0 * DWT_TIME_UNITS * SPEED_OF_LIGHT;
-
-        LOG_INF("Calculated range: %f m\n", range);
-
-        k_sleep(K_SECONDS(1));
+        return;
+    default:
     }
+
+    struct dw3000_msg_data rx_message = {0};
+    dwt_readrxdata((uint8_t*)&rx_message, DW_MSG_DATA_TXRX_LEN, 0);
+
+    uint64_t tx_timestamp = 0;
+    dwt_readtxtimestamp((uint8_t*)&tx_timestamp);
+
+    uint64_t rx_timestamp = 0;
+    dwt_readrxtimestamp((uint8_t*)&rx_timestamp, DWT_COMPAT_NONE);
+
+    LOG_INF("DW3000 RX event Device ID = 0x%llx", rx_message.device_id);
+    LOG_INF("DW3000 TX timestamp: %llu", tx_timestamp);
+    LOG_INF("DW3000 RX timestamp = %llu", rx_timestamp);
+    LOG_INF("DW3000 Reply time = %llu\n", rx_message.reply_time);
+
+    double offset = ((float)dwt_readclockoffset()) / (uint32_t)(1 << 26);
+    double range =
+        (rx_timestamp - tx_timestamp - rx_message.reply_time * (1.0 - offset)) /
+        2.0 * DWT_TIME_UNITS * SPEED_OF_LIGHT;
+
+    LOG_INF("Calculated range: %f m\n", range);
 }
 
 int main(void)
 {
+    k_event_init(&dw3000_events);
+    k_timer_init(&dw3000_tx_timer, dw3000_tx_timer_expires, NULL);
+
     uint64_t device_id = 0;
     if (dw3000_initialize(&device_id) != 0)
     {
@@ -646,20 +606,51 @@ int main(void)
         return -1;
     }
 
-    // IEEE standard message type for a blink is 0xC5, followed by sequence
-    // number, then eight byte device ID:
     struct dw3000_msg_data tx_message = {0};
     tx_message.device_id = device_id;
 
-    LOG_INF("");
+    LOG_INF("Starting main loop:\n");
 
     if (INITIATOR_DEVICE_ID == device_id)
     {
-        manage_initiator_messages(&tx_message);
+        tx_message.msg_type = DW3000_INIT_TX_TYPE;
+        k_timer_start(&dw3000_tx_timer, K_SECONDS(1), K_SECONDS(1));
     }
     else
     {
-        manage_responder_messages(&tx_message);
+        tx_message.msg_type = DW3000_RESP_TX_TYPE;
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+
+    while (true)
+    {
+        uint32_t event = k_event_wait(&dw3000_events,
+            DW3000_RX_OK | DW3000_RX_ERR | DW3000_TX_START, true, K_FOREVER);
+
+        switch ((enum dw3000_event_type)event)
+        {
+        case DW3000_RX_OK:
+            manage_responder_messages(&tx_message);
+
+            break;
+
+        case DW3000_RX_ERR:
+            LOG_WRN("Error receiving DW3000 message!");
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+            break;
+
+        case DW3000_TX_START:
+            manage_initiator_messages(&tx_message);
+
+            break;
+
+        case DW3000_TIMEOUT:
+            break;
+
+        case DW3000_TX_DONE:
+            break;
+        }
     }
 
     return 0;
