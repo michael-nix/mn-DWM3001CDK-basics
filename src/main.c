@@ -611,6 +611,8 @@ int main(void)
 
     LOG_INF("Starting main loop:\n");
 
+    // Start periodic transmission of initiator messages, or turn on the
+    // receiver for the responder:
     if (INITIATOR_DEVICE_ID == device_id)
     {
         tx_message.msg_type = DW3000_INIT_TX_TYPE;
@@ -643,7 +645,7 @@ int main(void)
             break;
 
         case DW3000_RX_ERR:
-            LOG_WRN("Error receiving DW3000 message!");
+            LOG_WRN("Error receiving DW3000 message, re-enabling receiver.");
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
             break;
