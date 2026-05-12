@@ -622,6 +622,14 @@ int main(void)
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
     }
 
+    // At this level, only initiators will ever receive `DW3000_TX_START`
+    // events, and only responders will receive `DW3000_RX_OK` or
+    // `DW3000_RX_ERR` events (an intitiator doesn't even have its receiver on
+    // at this point).  The `dw3000_events` object is re-used lower down so that
+    // an initiator can immediately receive a message and handle it differently
+    // than a responder would.  `DW3000_TX_TIMEOUT` events never happen, as
+    // that's a timeout on waiting for an event.  Timeouts when trying to
+    // receive a message are just errors.
     while (true)
     {
         uint32_t event = k_event_wait(&dw3000_events,
