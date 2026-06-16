@@ -5,6 +5,11 @@ project(mn-DWM3001CDK-basics)
 
 add_subdirectory(lib/dwt_uwb_driver)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE 
+    src/main.c
+    src/threads/dw3000_thread.c
+)
+
+target_include_directories(app PRIVATE src/threads/include)
 
 target_link_libraries(app PRIVATE uwb_driver)
