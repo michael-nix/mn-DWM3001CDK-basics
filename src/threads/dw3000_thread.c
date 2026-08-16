@@ -559,13 +559,12 @@ static int dw3000_wake_from_sleep(void)
 static int dw3000_wake_and_reinit(uint64_t* device_id)
 {
     int error = dw3000_wake_from_sleep();
-    if (error == 0)
+    if (0 == error)
     {
         return 0;
     }
 
-    LOG_ERR("Failed to wake DW3000, resetting device and "
-            "skipping this cycle.");
+    LOG_ERR("<%s> Failed to wake DW3000, resetting device and skipping this cycle.", __func__);
 
     dw3000_reset();
     dw3000_initialize(device_id);
@@ -574,7 +573,7 @@ static int dw3000_wake_and_reinit(uint64_t* device_id)
     return error;
 }
 
-void responder_range_reply(struct dw3000_msg_data* responder_message)
+int responder_range_reply(struct dw3000_msg_data* responder_message)
 {
     responder_message->msg_type = DW3000_RESP_RANGE_TYPE;
 
@@ -599,17 +598,16 @@ void responder_range_reply(struct dw3000_msg_data* responder_message)
     int32_t error = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
     if (DWT_SUCCESS != error)
     {
-        LOG_WRN("DW3000 transmission was cancelled, transmit time has "
-                "passed!\n");
+        LOG_WRN("<%s> DW3000 transmission was cancelled, transmit time has passed!\n", __func__);
 
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-        return;
+        return -ETIMEDOUT;
     }
 
     LOG_INF("DW3000 RX timestamp = %llu", rx_timestamp);
     LOG_INF("Transmit time: %llu", (uint64_t)transmit_time << 8);
     LOG_INF("Reply time: %llu\n", responder_message->reply_time);
+
+    return 0;
 }
 
 /*
@@ -623,13 +621,12 @@ void responder_range_reply(struct dw3000_msg_data* responder_message)
    initiator,
      - `paired_initiator_id` - a pointer to the ID of the initiator once paired with this responder.
 */
-void responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id)
+int responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id)
 {
     dwt_forcetrxoff();
 
-    // wait a random amount of time before responding to try to avoid
-    // collisions with all other responders that will also be trying to pair
-    // with initiator:
+    // wait a random amount of time before responding to try to avoid collisions with all other
+    // responders that will also be trying to pair with initiator:
     k_sleep(K_MSEC(sys_rand8_get() % (DW3000_MAX_WAIT_UNTIL_IDLE_MS - 6)));
 
     dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)responder_message, 0);
@@ -642,9 +639,8 @@ void responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* p
     case DW3000_TIMEOUT:
     case DW3000_RX_ERR:
         LOG_WRN("<%s> Error or timeout when receiving ACK message from initiator!", __func__);
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
-        return;
+        return -ETIMEDOUT;
 
     case DW3000_RX_OK:
         break;
@@ -659,20 +655,18 @@ void responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* p
     struct dw3000_msg_data rx_message = {0};
     dwt_readrxdata((uint8_t*)&rx_message, DW_MSG_DATA_TXRX_LEN, 0);
 
-    // return early if it's the wrong message type, or if the initiator is
-    // asking for a different device:
+    // return early if it's the wrong message type, or if the initiator is asking for a different
+    // device:
     if (((uint8_t)DW3000_INIT_ACK_TYPE != rx_message.msg_type) &&
         (rx_message.responder_id == responder_message->responder_id))
     {
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-        return;
+        return -EBADMSG;
     }
 
     *paired_initiator_id = rx_message.initiator_id;
     responder_message->initiator_id = *paired_initiator_id;
 
-    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    return 0;
 }
 
 /*
@@ -686,9 +680,11 @@ void responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* p
    initiator.  If the ACK is received, the initiator ID is recorded and the two devices are
    considered paired.  The responder will now respond to range requests.
 */
-void manage_responder_messages(
+int manage_responder_messages(
     struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id)
 {
+    int error = 0;
+
     struct dw3000_msg_data rx_message = {0};
     dwt_readrxdata((uint8_t*)&rx_message, DW_MSG_DATA_TXRX_LEN, 0);
 
@@ -698,29 +694,30 @@ void manage_responder_messages(
         (rx_message.initiator_id == *paired_initiator_id) &&
         (rx_message.responder_id == responder_message->responder_id))
     {
-        responder_range_reply(responder_message);
+        error = responder_range_reply(responder_message);
     }
 
     // Only pair if there is no recorded initiator ID:
     else if (((uint8_t)DW3000_INIT_PAIR_TYPE == rx_message.msg_type) && (*paired_initiator_id == 0))
     {
-        // immediately send response, then wait for ACK, then record
-        // initiator ID.
+        // immediately send response, then wait for ACK, then record initiator ID.
         responder_message->msg_type = DW3000_RESP_PAIR_TYPE;
         responder_message->initiator_id = rx_message.initiator_id;
 
-        responder_pair_reply(responder_message, paired_initiator_id);
+        error = responder_pair_reply(responder_message, paired_initiator_id);
     }
 
     // If it's not a range message meant for us, or a pairing message, ignore
     // it:
     else
     {
-        LOG_WRN("DW3000 received wrong message type! Got 0x%x from device: 0x%llx",
+        LOG_WRN("<%s> DW3000 received wrong message type! Got 0x%x from device: 0x%llx", __func__,
             rx_message.msg_type, rx_message.initiator_id);
 
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        error = -EBADMSG;
     }
+
+    return error;
 }
 
 void initiator_measure_range(struct dw3000_msg_data* initiator_message)
@@ -735,12 +732,12 @@ void initiator_measure_range(struct dw3000_msg_data* initiator_message)
     switch ((enum dw3000_event_type)event)
     {
     case DW3000_TIMEOUT:
-        LOG_WRN("Didn't receive expected DW3000 ranging RX event in time!\n");
+        LOG_WRN("<%s> Didn't receive expected DW3000 ranging RX event in time!\n", __func__);
 
         return;
 
     case DW3000_RX_ERR:
-        LOG_WRN("DW3000 initiator failed to receive a ranging message!\n");
+        LOG_WRN("<%s> DW3000 initiator failed to receive a ranging message!\n", __func__);
 
         return;
 
@@ -759,9 +756,8 @@ void initiator_measure_range(struct dw3000_msg_data* initiator_message)
 
     if (DW3000_RESP_RANGE_TYPE != rx_message.msg_type)
     {
-        LOG_ERR("DW3000 received wrong message type! Expected 0x%x, got 0x%x",
+        LOG_ERR("<%s> DW3000 received wrong message type! Expected 0x%x, got 0x%x", __func__,
             (uint8_t)DW3000_RESP_RANGE_TYPE, rx_message.msg_type);
-        // dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
         return;
     }
@@ -1001,8 +997,9 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
         switch ((enum dw3000_event_type)event)
         {
         case DW3000_WAKE_UP:
+        {
             int error = dw3000_wake_and_reinit(&device_id);
-            if (error != 0)
+            if (0 != error)
             {
                 k_timer_start(&dw3000_timer, K_MSEC(DW3000_RESPONDER_SLEEP_MS), K_FOREVER);
 
@@ -1012,13 +1009,15 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
             break;
-
+        }
         case DW3000_RX_OK:
-            // TODO: keep antenna on if range messages also fail:
-            manage_responder_messages(&tx_message, &paired_initiator_id);
+        {
+            int error = manage_responder_messages(&tx_message, &paired_initiator_id);
 
-            if (paired_initiator_id == 0)
+            if (0 != error)
             {
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
                 break;
             }
 
@@ -1028,6 +1027,7 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
             k_timer_start(&dw3000_timer, K_MSEC(DW3000_RESPONDER_SLEEP_MS), K_FOREVER);
 
             break;
+        }
 
         case DW3000_RX_ERR:
             LOG_WRN("<%s> Error receiving DW3000 message, re-enabling receiver.", __func__);
