@@ -15,16 +15,20 @@ BAUD_RATE = 115200
 TARGET_VID = 0x2FE3  # default value
 TARGET_PID = 0x100  # default value
 
+
 def find_port_by_vid_pid(vid=TARGET_VID, pid=TARGET_PID):
     """Return the first port matching the given VID/PID."""
 
     for port_info in serial.tools.list_ports.comports():
         if port_info.vid == vid and port_info.pid == pid:
-            print(f"Found matching device: {port_info.device} "
-                  f"(VID=0x{vid:04X}, PID=0x{pid:04X})")
-            
+            print(
+                f"Found matching device: {port_info.device} "
+                f"(VID=0x{vid:04X}, PID=0x{pid:04X})"
+            )
+
             return port_info.device
     return None
+
 
 if __name__ == "__main__":
     port = find_port_by_vid_pid()
@@ -47,7 +51,7 @@ if __name__ == "__main__":
                 continue
 
             data_strings = data_strings[-1].split(",")
-            if len(data_strings) is 2:
+            if len(data_strings) == 2:
                 print("Device ID: " + data_strings[0], "-- Range: " + data_strings[1])
 
     except serial.SerialException as e:
