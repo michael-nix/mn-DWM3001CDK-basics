@@ -989,6 +989,9 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
     // differently than a responder would.  Timeouts when trying to receive a message are just
     // errors.  Timeouts when waiting to receive an event will let a responder pair with another
     // initiator.
+    //
+    // TODO: decouple initator and responder loops; just call different functions in above if-else
+    // block.
     while (true)
     {
         uint32_t event = k_event_wait(&dw3000_events,
@@ -998,7 +1001,6 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
         switch ((enum dw3000_event_type)event)
         {
         case DW3000_WAKE_UP:
-            // Wake and re‑init the DW3000 before any SPI operations
             int error = dw3000_wake_and_reinit(&device_id);
             if (error != 0)
             {
@@ -1012,6 +1014,7 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
             break;
 
         case DW3000_RX_OK:
+            // TODO: keep antenna on if range messages also fail:
             manage_responder_messages(&tx_message, &paired_initiator_id);
 
             if (paired_initiator_id == 0)
@@ -1033,12 +1036,10 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
             break;
 
         case DW3000_TX_START:
-            // Wake and re‑init the DW3000 before any SPI operations
             dw3000_wake_and_reinit(&device_id);
 
             manage_initiator_messages(&tx_message);
 
-            // After all initiator operations, go back to deep sleep
             dwt_forcetrxoff();
             dwt_entersleep(DWT_DW_IDLE_RC);
 
