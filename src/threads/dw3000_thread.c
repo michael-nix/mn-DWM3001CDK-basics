@@ -32,12 +32,15 @@ LOG_MODULE_REGISTER(dw3000_thread, LOG_LEVEL_INF);
 // Speed of light... (m / s)
 #define SPEED_OF_LIGHT (299702547.0)
 
-#define DW3000_MAX_RESPONDERS       10
-#define DW3000_MAX_WAIT_PAIR_MS     100
-#define DW3000_MAX_PAIRING_TIMEOUTS 3
-#define DW3000_MIN_PAIRS            6
-#define DW3000_MAX_TIMEOUT_RESP_RX  2.5
-#define DW3000_RESPONDER_SLEEP_MS   950
+#define DW3000_MAX_RESPONDERS        10
+#define DW3000_MAX_WAIT_PAIR_MS      100
+#define DW3000_MAX_PAIRING_TIMEOUTS  3
+#define DW3000_MIN_PAIRS             6
+#define DW3000_MAX_TIMEOUT_RESP_RX_S 2.5
+#define DW3000_RANGE_SLEEP_MS        975
+#define DW3000_PAIR_SLEEP_MS         750
+#define DW3000_MAX_NUM_COMM_ERRORS   3
+#define DW3000_MAX_TIME_TO_RESET_MS  3000
 
 // In order to support both slow and fast SPI rates, we define two `spi_dt_spec`s, and switch
 // between them by changing the pointer `dw3000_spi` which is used in the SPI communication
@@ -256,7 +259,7 @@ struct k_timer dw3000_timer = {0};
 
 enum dw3000_event_type
 {
-    DW3000_TIMEOUT = 0,
+    DW3000_EVENT_TIMEOUT = 0,
     DW3000_RX_OK = BIT(0),
     DW3000_RX_ERR = BIT(1),
     DW3000_TX_START = BIT(2),
@@ -284,8 +287,6 @@ void dw3000_rxok_callback(const dwt_cb_data_t* data) { k_event_post(&dw3000_even
 */
 void dw3000_rxerr_callback(const dwt_cb_data_t* data)
 {
-    LOG_ERR("<%s> Error receiving DW3000 frame.", __func__);
-
     k_event_post(&dw3000_events, DW3000_RX_ERR);
 }
 
@@ -573,6 +574,14 @@ static int dw3000_wake_and_reinit(uint64_t* device_id)
     return error;
 }
 
+static inline void dw3000_responder_sleep(int timeout_ms)
+{
+    dwt_forcetrxoff();
+    dwt_entersleep(DWT_DW_IDLE_RC);
+
+    k_timer_start(&dw3000_timer, K_MSEC(timeout_ms), K_FOREVER);
+}
+
 int responder_range_reply(struct dw3000_msg_data* responder_message)
 {
     responder_message->msg_type = DW3000_RESP_RANGE_TYPE;
@@ -595,7 +604,7 @@ int responder_range_reply(struct dw3000_msg_data* responder_message)
     dwt_writetxdata(DW_MSG_DATA_TXRX_LEN, (uint8_t*)responder_message, 0);
     dwt_writetxfctrl(DW_MSG_DATA_TXRX_LEN + 2, 0, 1); // + 2 bytes for CRC
 
-    int32_t error = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+    int32_t error = dwt_starttx(DWT_START_TX_DELAYED);
     if (DWT_SUCCESS != error)
     {
         LOG_WRN("<%s> DW3000 transmission was cancelled, transmit time has passed!\n", __func__);
@@ -603,9 +612,12 @@ int responder_range_reply(struct dw3000_msg_data* responder_message)
         return -ETIMEDOUT;
     }
 
-    LOG_INF("DW3000 RX timestamp = %llu", rx_timestamp);
-    LOG_INF("Transmit time: %llu", (uint64_t)transmit_time << 8);
-    LOG_INF("Reply time: %llu\n", responder_message->reply_time);
+    LOG_DBG("DW3000 RX timestamp = %llu", rx_timestamp);
+    LOG_DBG("Transmit time: %llu", (uint64_t)transmit_time << 8);
+    LOG_DBG("Reply time: %llu\n", responder_message->reply_time);
+
+    k_event_wait(&dw3000_events, DW3000_TX_DONE, true, K_MSEC(10));
+    dw3000_responder_sleep(DW3000_RANGE_SLEEP_MS);
 
     return 0;
 }
@@ -636,7 +648,7 @@ int responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* pa
     uint32_t event = k_event_wait(&dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(10));
     switch ((enum dw3000_event_type)event)
     {
-    case DW3000_TIMEOUT:
+    case DW3000_EVENT_TIMEOUT:
     case DW3000_RX_ERR:
         LOG_WRN("<%s> Error or timeout when receiving ACK message from initiator!", __func__);
 
@@ -657,14 +669,16 @@ int responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* pa
 
     // return early if it's the wrong message type, or if the initiator is asking for a different
     // device:
-    if (((uint8_t)DW3000_INIT_ACK_TYPE != rx_message.msg_type) &&
-        (rx_message.responder_id == responder_message->responder_id))
+    if (((uint8_t)DW3000_INIT_ACK_TYPE != rx_message.msg_type) ||
+        (rx_message.responder_id != responder_message->responder_id))
     {
         return -EBADMSG;
     }
 
     *paired_initiator_id = rx_message.initiator_id;
     responder_message->initiator_id = *paired_initiator_id;
+
+    dw3000_responder_sleep(DW3000_PAIR_SLEEP_MS);
 
     return 0;
 }
@@ -698,7 +712,7 @@ int manage_responder_messages(
     }
 
     // Only pair if there is no recorded initiator ID:
-    else if (((uint8_t)DW3000_INIT_PAIR_TYPE == rx_message.msg_type) && (*paired_initiator_id == 0))
+    else if (((uint8_t)DW3000_INIT_PAIR_TYPE == rx_message.msg_type) && (0 == *paired_initiator_id))
     {
         // immediately send response, then wait for ACK, then record initiator ID.
         responder_message->msg_type = DW3000_RESP_PAIR_TYPE;
@@ -711,7 +725,7 @@ int manage_responder_messages(
     // it:
     else
     {
-        LOG_WRN("<%s> DW3000 received wrong message type! Got 0x%x from device: 0x%llx", __func__,
+        LOG_DBG("<%s> DW3000 received wrong message! Got 0x%x from device: 0x%llx", __func__,
             rx_message.msg_type, rx_message.initiator_id);
 
         error = -EBADMSG;
@@ -720,7 +734,7 @@ int manage_responder_messages(
     return error;
 }
 
-void initiator_measure_range(struct dw3000_msg_data* initiator_message)
+int initiator_measure_range(struct dw3000_msg_data* initiator_message)
 {
     dwt_forcetrxoff();
 
@@ -731,15 +745,15 @@ void initiator_measure_range(struct dw3000_msg_data* initiator_message)
     uint32_t event = k_event_wait(&dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(10));
     switch ((enum dw3000_event_type)event)
     {
-    case DW3000_TIMEOUT:
+    case DW3000_EVENT_TIMEOUT:
         LOG_WRN("<%s> Didn't receive expected DW3000 ranging RX event in time!\n", __func__);
 
-        return;
+        return -ETIMEDOUT;
 
     case DW3000_RX_ERR:
         LOG_WRN("<%s> DW3000 initiator failed to receive a ranging message!\n", __func__);
 
-        return;
+        return -EBADMSG;
 
     // impossible cases; added for compiler warnings:
     case DW3000_WAKE_UP:
@@ -759,7 +773,7 @@ void initiator_measure_range(struct dw3000_msg_data* initiator_message)
         LOG_ERR("<%s> DW3000 received wrong message type! Expected 0x%x, got 0x%x", __func__,
             (uint8_t)DW3000_RESP_RANGE_TYPE, rx_message.msg_type);
 
-        return;
+        return -EBADMSG;
     }
 
     if (rx_message.responder_id != initiator_message->responder_id)
@@ -768,7 +782,7 @@ void initiator_measure_range(struct dw3000_msg_data* initiator_message)
                 "%llx, got %llx",
             initiator_message->responder_id, rx_message.responder_id);
 
-        return;
+        return -EBADMSG;
     }
 
     uint64_t tx_timestamp = 0;
@@ -794,11 +808,14 @@ void initiator_measure_range(struct dw3000_msg_data* initiator_message)
     else
     {
         LOG_ERR("<%s> Error calculating range; range was negative!", __func__);
-        LOG_WRN("DW3000 RX event Device ID = 0x%llx", rx_message.initiator_id);
-        LOG_WRN("DW3000 TX timestamp: %llu", tx_timestamp);
-        LOG_WRN("DW3000 RX timestamp = %llu", rx_timestamp);
-        LOG_WRN("DW3000 Reply time = %llu\n", rx_message.reply_time);
+        LOG_DBG("DW3000 RX event Device ID = 0x%llx", rx_message.initiator_id);
+        LOG_DBG("DW3000 TX timestamp: %llu", tx_timestamp);
+        LOG_DBG("DW3000 RX timestamp = %llu", rx_timestamp);
+        LOG_DBG("DW3000 Reply time = %llu\n", rx_message.reply_time);
+        LOG_INF("%llx,%f\n", rx_message.responder_id, 0);
     }
+
+    return 0;
 }
 
 // send a single pairing init message, and process all messages that come in
@@ -830,6 +847,9 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
         sleep_time_ms =
             sleep_time_ms >= DW3000_MAX_WAIT_PAIR_MS ? 0 : DW3000_MAX_WAIT_PAIR_MS - sleep_time_ms;
 
+        if (0 == sleep_time_ms)
+            break;
+
         event =
             k_event_wait(&dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(sleep_time_ms));
 
@@ -858,9 +878,10 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
             dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 
             bool responder_in_list = false;
-            for (uint8_t responder = 0; responder < *nresponders; responder++)
+            uint8_t ridx = 0;
+            for (; ridx < DW3000_MAX_RESPONDERS; ridx++)
             {
-                if (rx_message.responder_id == responder_list[responder])
+                if (rx_message.responder_id == responder_list[ridx])
                 {
                     responder_in_list = true;
                     break;
@@ -868,10 +889,19 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
             }
 
             if (responder_in_list)
+                continue;
+
+            for (ridx = 0; ridx < DW3000_MAX_RESPONDERS; ridx++)
+            {
+                if (0 == responder_list[ridx])
+                    break;
+            }
+
+            if (DW3000_MAX_RESPONDERS <= ridx)
                 break;
 
             LOG_INF("Adding device 0x%llx to responder list.", rx_message.responder_id);
-            responder_list[*nresponders] = rx_message.responder_id;
+            responder_list[ridx] = rx_message.responder_id;
             *nresponders += 1;
 
             break;
@@ -882,7 +912,7 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
 
             break;
 
-        case DW3000_TIMEOUT:
+        case DW3000_EVENT_TIMEOUT:
             break;
 
         // impossible cases; added for compiler warnings.
@@ -892,7 +922,7 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
             break;
         }
 
-    } while (DW3000_TIMEOUT != event);
+    } while (DW3000_EVENT_TIMEOUT != event);
 
     // no new responders added, must have timed out without finding any:
     if (current_nresponders == *nresponders)
@@ -910,9 +940,9 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
    original message transmit time, the responder's reply receive time, and the responder's time to
    reply to calculate a distance between the initiator and responder.
 
-   The initiator then trys to find unpaired responders by sending a pairing message, and waiting for
-   respones for a maximum of 100 ms.  If it receives a response, it acknowledges the message, and
-   then it adds it to its `responder_list` (unless it's already there).
+   The initiator then tries to find unpaired responders by sending a pairing message, and waiting
+   for respones for a maximum of 100 ms.  If it receives a response, it acknowledges the message,
+   and then it adds it to its `responder_list` (unless it's already there).
 
    #### Parameters:
     - `initiator_message` - a poiner to the `dw3000_msg_data` to be sent to and from responders.
@@ -922,16 +952,44 @@ void manage_initiator_messages(struct dw3000_msg_data* initiator_message)
     initiator_message->msg_type = DW3000_INIT_RANGE_TYPE;
 
     static uint64_t responder_list[DW3000_MAX_RESPONDERS] = {0};
+    static uint8_t nmissed[DW3000_MAX_RESPONDERS] = {0};
     static uint8_t nresponders = 0;
     static uint8_t ntimeouts = 0;
 
     // for every responder recorded, attempt to get a range once:
-    for (uint8_t responder = 0; responder < nresponders; responder++)
+    uint8_t nranges = 0;
+    for (uint8_t ridx = 0; ridx < DW3000_MAX_RESPONDERS; ridx++)
     {
-        initiator_message->responder_id = responder_list[responder];
+        if (nresponders <= nranges)
+            break;
+
+        if (0 == responder_list[ridx])
+            continue;
+
+        initiator_message->responder_id = responder_list[ridx];
         LOG_DBG("DW3000 TX event Device ID = 0x%llx", initiator_message->initiator_id);
 
-        initiator_measure_range(initiator_message);
+        int error = initiator_measure_range(initiator_message);
+        if (0 != error)
+        {
+            nmissed[ridx]++;
+            if (DW3000_MAX_NUM_COMM_ERRORS <= nmissed[ridx])
+            {
+                nmissed[ridx] = 0;
+                responder_list[ridx] = 0;
+                nresponders--;
+                ntimeouts = 0;
+            }
+
+            continue;
+        }
+        else
+        {
+            k_msleep(5);
+        }
+
+        nranges++;
+        nmissed[ridx] = 0;
     }
 
     // have enough responders, but have tried to find more but can't; or, have max:
@@ -988,11 +1046,13 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
     //
     // TODO: decouple initator and responder loops; just call different functions in above if-else
     // block.
+    uint64_t last_successul_msg = k_uptime_get();
+    uint64_t now = k_uptime_get();
     while (true)
     {
         uint32_t event = k_event_wait(&dw3000_events,
             DW3000_RX_OK | DW3000_RX_ERR | DW3000_TX_START | DW3000_WAKE_UP, true,
-            K_SECONDS(DW3000_MAX_TIMEOUT_RESP_RX));
+            K_SECONDS(DW3000_MAX_TIMEOUT_RESP_RX_S));
 
         switch ((enum dw3000_event_type)event)
         {
@@ -1001,7 +1061,7 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
             int error = dw3000_wake_and_reinit(&device_id);
             if (0 != error)
             {
-                k_timer_start(&dw3000_timer, K_MSEC(DW3000_RESPONDER_SLEEP_MS), K_FOREVER);
+                k_timer_start(&dw3000_timer, K_MSEC(DW3000_RANGE_SLEEP_MS), K_FOREVER);
 
                 break;
             }
@@ -1013,27 +1073,20 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
         case DW3000_RX_OK:
         {
             int error = manage_responder_messages(&tx_message, &paired_initiator_id);
-
+            // Timeout / failing to reply to initiator:
             if (0 != error)
             {
+                dwt_forcetrxoff();
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-                break;
             }
-
-            dwt_forcetrxoff();
-            dwt_entersleep(DWT_DW_IDLE_RC);
-
-            k_timer_start(&dw3000_timer, K_MSEC(DW3000_RESPONDER_SLEEP_MS), K_FOREVER);
+            // Successfully ranged or paired:
+            else
+            {
+                last_successul_msg = k_uptime_get();
+            }
 
             break;
         }
-
-        case DW3000_RX_ERR:
-            LOG_WRN("<%s> Error receiving DW3000 message, re-enabling receiver.", __func__);
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-            break;
 
         case DW3000_TX_START:
             dw3000_wake_and_reinit(&device_id);
@@ -1048,13 +1101,26 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
         // for responders that need to pair with an initiator, if it hasn't heard from it for a
         // while, reset the paired ID so that it will again respond to pairing messages from an
         // initiator:
-        case DW3000_TIMEOUT:
+        case DW3000_EVENT_TIMEOUT:
             paired_initiator_id = 0;
+        case DW3000_RX_ERR:
+            LOG_WRN(
+                "<%s> Timeout, or error receiving DW3000 message, re-enabling receiver.", __func__);
+            dwt_forcetrxoff();
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
             break;
 
         case DW3000_TX_DONE:
             break;
+        }
+
+        now = k_uptime_get();
+        LOG_DBG("%lld", now - last_successul_msg);
+        if ((now - last_successul_msg) > DW3000_MAX_TIME_TO_RESET_MS)
+        {
+            paired_initiator_id = 0;
+            last_successul_msg = now;
         }
     }
 }
