@@ -155,13 +155,13 @@ static void dw_setfastrate(void) { dw3000_spi = &dw_spi_fast; }
 */
 static void dw_wakeup_device_with_io(void)
 {
-    gpio_pin_set_dt(&(dw3000_spi->config.cs.gpio), GPIO_OUTPUT_ACTIVE);
+    gpio_pin_set_dt(&(dw3000_spi->config.cs.gpio), 0);
     k_busy_wait(500);
 
-    gpio_pin_set_dt(&(dw3000_spi->config.cs.gpio), GPIO_OUTPUT_INACTIVE);
+    gpio_pin_set_dt(&(dw3000_spi->config.cs.gpio), 1);
 
     // wait for DW to wake up:
-    k_busy_wait(500);
+    k_msleep(5);
 }
 
 /*
@@ -317,51 +317,13 @@ void dw3000_reset(void)
     k_msleep(2);
 }
 
-/*
-   This function does a lot and can be cleaned up, but it contains everything needed to set up the
-   DW3000 for use:
-    - Initializes the event object used to signal message events,
-    - Initializes GPIO and SPI peripherals, based on the device tree & overlay,
-    - Sets up interrupts and their callbacks,
-    - Probes the DW3000, initializing the driver,
-    - Initializes and then configures the DW3000 based on configuration settings in the device tree
-      overlay,
-    - Determines the full device ID,
-    - Configures transmission spectrum and antenna delay,
-    - Turns on the LEDs (they flash when it sends a message).
-*/
-int dw3000_initialize(uint64_t* device_id)
+static int dw3000_reset_configure()
 {
-    k_event_init(&dw3000_events);
-
-    if (!spi_is_ready_dt(dw3000_spi))
-    {
-        LOG_ERR("SPI bus not ready");
-        return -ENODEV;
-    }
-
-    if (!gpio_is_ready_dt(&dw3000_reset_pin) || !gpio_is_ready_dt(&dw3000_irq_pin))
-    {
-        LOG_ERR("GPIOs not ready");
-        return -ENODEV;
-    }
-
-    dw_spi_slow.config.frequency = DT_PROP(DW3000_NODE, spi_min_frequency);
-    dw_spi_fast.config.frequency = DT_PROP(DW3000_NODE, spi_max_frequency);
-
-    gpio_pin_configure_dt(&dw3000_reset_pin, GPIO_OUTPUT_INACTIVE);
-    gpio_pin_configure_dt(&dw3000_spi->config.cs.gpio, GPIO_OUTPUT_INACTIVE);
-    gpio_pin_configure_dt(&dw3000_irq_pin, GPIO_INPUT);
-
-    gpio_init_callback(&dw3000_irq_callback, dw3000_irq_handler, BIT(dw3000_irq_pin.pin));
-    gpio_add_callback(dw3000_irq_pin.port, &dw3000_irq_callback);
-    gpio_pin_interrupt_configure_dt(&dw3000_irq_pin, GPIO_INT_EDGE_TO_ACTIVE);
-
-    LOG_INF("SPI peripheral for DW3000 initialized.");
-
     dw3000_reset();
 
     LOG_INF("DW3000 reset complete.");
+
+    dw_setslowrate();
 
     if (dwt_probe(&dw_probe) != DWT_SUCCESS)
     {
@@ -392,9 +354,6 @@ int dw3000_initialize(uint64_t* device_id)
     LOG_INF("DW3000 in IDLE_RC, proceeding with initialise.");
 
     dw_setfastrate();
-
-    uint32_t dev_id = dwt_readdevid();
-    LOG_INF("DW3000 DEV_ID = 0x%08x", dev_id);
 
     if (DWT_ERROR == dwt_initialise(DWT_DW_INIT))
     {
@@ -463,13 +422,6 @@ int dw3000_initialize(uint64_t* device_id)
 
     LOG_INF("DW3000 configured.");
 
-    uint64_t lot_id = dwt_getlotid();   // 48 bits
-    uint32_t part_id = dwt_getpartid(); // 32 bits
-    uint64_t full_id = (lot_id << 16) + (uint64_t)part_id;
-    *device_id = full_id;
-
-    LOG_INF("DW3000 Full ID: 0x%llx", full_id);
-
     // From Table 7 of the DW3000 Software API Guide:
     dwt_txconfig_t tx_config = {0};
     if (5 == DT_PROP(DW3000_NODE, chan))
@@ -507,6 +459,62 @@ int dw3000_initialize(uint64_t* device_id)
 }
 
 /*
+   This function does a lot and can be cleaned up, but it contains everything needed to set up the
+   DW3000 for use:
+    - Initializes the event object used to signal message events,
+    - Initializes GPIO and SPI peripherals, based on the device tree & overlay,
+    - Sets up interrupts and their callbacks,
+    - Probes the DW3000, initializing the driver,
+    - Initializes and then configures the DW3000 based on configuration settings in the device tree
+      overlay,
+    - Determines the full device ID,
+    - Configures transmission spectrum and antenna delay,
+    - Turns on the LEDs (they flash when it sends a message).
+*/
+static int dw3000_initialize(uint64_t* device_id)
+{
+    k_event_init(&dw3000_events);
+
+    if (!spi_is_ready_dt(dw3000_spi))
+    {
+        LOG_ERR("SPI bus not ready");
+        return -ENODEV;
+    }
+
+    if (!gpio_is_ready_dt(&dw3000_reset_pin) || !gpio_is_ready_dt(&dw3000_irq_pin))
+    {
+        LOG_ERR("GPIOs not ready");
+        return -ENODEV;
+    }
+
+    dw_spi_slow.config.frequency = DT_PROP(DW3000_NODE, spi_min_frequency);
+    dw_spi_fast.config.frequency = DT_PROP(DW3000_NODE, spi_max_frequency);
+
+    gpio_pin_configure_dt(&dw3000_reset_pin, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_configure_dt(&dw3000_spi->config.cs.gpio, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_configure_dt(&dw3000_irq_pin, GPIO_INPUT);
+
+    gpio_init_callback(&dw3000_irq_callback, dw3000_irq_handler, BIT(dw3000_irq_pin.pin));
+    gpio_add_callback(dw3000_irq_pin.port, &dw3000_irq_callback);
+    gpio_pin_interrupt_configure_dt(&dw3000_irq_pin, GPIO_INT_EDGE_TO_ACTIVE);
+
+    LOG_INF("SPI peripheral for DW3000 initialized.");
+
+    int error = dw3000_reset_configure();
+    if (0 != error)
+        return error;
+
+    uint64_t lot_id = dwt_getlotid();   // 48 bits
+    uint32_t part_id = dwt_getpartid(); // 32 bits
+    uint64_t full_id = (lot_id << 16) + (uint64_t)part_id;
+    *device_id = full_id;
+
+    LOG_INF("DW3000 Full ID: 0x%llx", full_id);
+
+    return 0;
+}
+
+/*
    Wake the DW3000 from deep sleep and re‑initialize it.  Must be called before
    any SPI transaction after deep sleep.
 
@@ -517,12 +525,14 @@ static int dw3000_wake_from_sleep(void)
 {
     dw_wakeup_device_with_io();
 
+    decaIrqStatus_t status = decamutexon();
+
     dw_setslowrate();
 
     int i;
     for (i = 0; i < DW3000_MAX_WAIT_UNTIL_IDLE_MS; i++)
     {
-        if (dwt_checkidlerc() == 1)
+        if (1 == dwt_checkidlerc())
         {
             break;
         }
@@ -530,20 +540,32 @@ static int dw3000_wake_from_sleep(void)
         k_msleep(1);
     }
 
-    if (i == DW3000_MAX_WAIT_UNTIL_IDLE_MS)
+    if (DW3000_MAX_WAIT_UNTIL_IDLE_MS == i)
     {
         LOG_ERR("DW3000 did not wake into IDLE_RC");
-        return -EIO;
+        decamutexoff(status);
+
+        return -EFAULT;
     }
 
     dw_setfastrate();
 
     dwt_restore_common();
-    dwt_restore_txrx(DWT_RESTORE_TXRX_MODE);
+
+    int32_t error = dwt_restore_txrx(DWT_RESTORE_TXRX_MODE);
+    if (DWT_SUCCESS != error)
+    {
+        LOG_ERR("Failed to restore TX / RX configuration after sleep.");
+        decamutexoff(status);
+
+        return -EFAULT;
+    }
 
     // make sure interrupts are cleared, set LEDs:
     dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
     dwt_setleds(DWT_LEDS_BLINK_TIME_DEF | DWT_LEDS_ENABLE);
+
+    decamutexoff(status);
 
     return 0;
 }
@@ -551,13 +573,10 @@ static int dw3000_wake_from_sleep(void)
 /*
    Wake a device from deep sleep, and if it fails, re-initialize it.
 
-   #### Parameters:
-    - device_id - a pointer to the device ID of this DW3000.
-
    #### Returns:
     - 0 if wake succeeds.
 */
-static int dw3000_wake_and_reinit(uint64_t* device_id)
+static int dw3000_wake_and_reinit()
 {
     int error = dw3000_wake_from_sleep();
     if (0 == error)
@@ -565,13 +584,18 @@ static int dw3000_wake_and_reinit(uint64_t* device_id)
         return 0;
     }
 
-    LOG_ERR("<%s> Failed to wake DW3000, resetting device and skipping this cycle.", __func__);
+    LOG_ERR("<%s> Failed to wake DW3000, resetting device.", __func__);
 
-    dw3000_reset();
-    dw3000_initialize(device_id);
-    dwt_entersleep(DWT_DW_IDLE_RC);
+    error = dw3000_reset_configure();
+    if (0 != error)
+    {
+        LOG_ERR("Couldn't re-initialize DW3000 after failed wake, hanging.");
+        k_sleep(K_FOREVER);
+    }
 
-    return error;
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+    return 0;
 }
 
 static inline void dw3000_responder_sleep(int timeout_ms)
@@ -582,7 +606,7 @@ static inline void dw3000_responder_sleep(int timeout_ms)
     k_timer_start(&dw3000_timer, K_MSEC(timeout_ms), K_FOREVER);
 }
 
-int responder_range_reply(struct dw3000_msg_data* responder_message)
+static int responder_range_reply(struct dw3000_msg_data* responder_message)
 {
     responder_message->msg_type = DW3000_RESP_RANGE_TYPE;
 
@@ -633,7 +657,8 @@ int responder_range_reply(struct dw3000_msg_data* responder_message)
    initiator,
      - `paired_initiator_id` - a pointer to the ID of the initiator once paired with this responder.
 */
-int responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id)
+static int responder_pair_reply(
+    struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id)
 {
     dwt_forcetrxoff();
 
@@ -694,7 +719,7 @@ int responder_pair_reply(struct dw3000_msg_data* responder_message, uint64_t* pa
    initiator.  If the ACK is received, the initiator ID is recorded and the two devices are
    considered paired.  The responder will now respond to range requests.
 */
-int manage_responder_messages(
+static int manage_responder_messages(
     struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id)
 {
     int error = 0;
@@ -734,7 +759,7 @@ int manage_responder_messages(
     return error;
 }
 
-int initiator_measure_range(struct dw3000_msg_data* initiator_message)
+static int initiator_measure_range(struct dw3000_msg_data* initiator_message)
 {
     dwt_forcetrxoff();
 
@@ -812,7 +837,7 @@ int initiator_measure_range(struct dw3000_msg_data* initiator_message)
         LOG_DBG("DW3000 TX timestamp: %llu", tx_timestamp);
         LOG_DBG("DW3000 RX timestamp = %llu", rx_timestamp);
         LOG_DBG("DW3000 Reply time = %llu\n", rx_message.reply_time);
-        LOG_INF("%llx,%f\n", rx_message.responder_id, 0);
+        LOG_INF("%llx,%f\n", rx_message.responder_id, range);
     }
 
     return 0;
@@ -983,10 +1008,6 @@ void manage_initiator_messages(struct dw3000_msg_data* initiator_message)
 
             continue;
         }
-        else
-        {
-            k_msleep(5);
-        }
 
         nranges++;
         nmissed[ridx] = 0;
@@ -1066,6 +1087,7 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
                 break;
             }
 
+            // dwt_forcetrxoff();
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
             break;
@@ -1076,7 +1098,7 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
             // Timeout / failing to reply to initiator:
             if (0 != error)
             {
-                dwt_forcetrxoff();
+                // dwt_forcetrxoff();
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
             }
             // Successfully ranged or paired:
@@ -1106,7 +1128,7 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
         case DW3000_RX_ERR:
             LOG_WRN(
                 "<%s> Timeout, or error receiving DW3000 message, re-enabling receiver.", __func__);
-            dwt_forcetrxoff();
+            // dwt_forcetrxoff();
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
             break;
@@ -1115,10 +1137,15 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
             break;
         }
 
+        // TODO: replace counter with proper timer for responders:
+        if (is_initiator)
+            continue;
+
         now = k_uptime_get();
         LOG_DBG("%lld", now - last_successul_msg);
         if ((now - last_successul_msg) > DW3000_MAX_TIME_TO_RESET_MS)
         {
+            LOG_WRN("Haven't talked to initiator in a while, resetting ID.");
             paired_initiator_id = 0;
             last_successul_msg = now;
         }
