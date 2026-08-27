@@ -267,17 +267,17 @@ enum dw3000_event_type
     DW3000_LOST_CONTACT = BIT(5),
 };
 
-void dw3000_tx_timer_expires(struct k_timer* timer)
+static void dw3000_tx_timer_expires(struct k_timer* timer)
 {
     k_event_post(&dw3000_events, DW3000_TX_START);
 }
 
-void dw3000_sleep_timer_expires(struct k_timer* timer)
+static void dw3000_sleep_timer_expires(struct k_timer* timer)
 {
     k_event_post(&dw3000_events, DW3000_WAKE_UP);
 }
 
-void dw3000_responder_loses_contact(struct k_timer* timer)
+static void dw3000_responder_loses_contact(struct k_timer* timer)
 {
     k_event_post(&dw3000_events, DW3000_LOST_CONTACT);
 }
@@ -296,7 +296,7 @@ void dw3000_rxerr_callback(const dwt_cb_data_t* data)
 }
 
 /*
-    Callback f unction for the DW3000 driver to call when transmission is finished.
+    Callback function for the DW3000 driver to call when transmission is finished.
 */
 void dw3000_txdone_callback(const dwt_cb_data_t* data)
 {
@@ -316,7 +316,7 @@ static dwt_callbacks_s dw3000_irq_callbacks = {
 /*
    Resets the DW3000 by toggling the reset pin.
 */
-void dw3000_reset(void)
+static void dw3000_reset(void)
 {
     gpio_pin_set_dt(&dw3000_reset_pin, 1);
     k_msleep(2);
