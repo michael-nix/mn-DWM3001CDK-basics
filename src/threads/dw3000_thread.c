@@ -327,7 +327,7 @@ static void dw3000_reset(void)
 
 /*
    Resets and then configures the DW3000 based on the settings in the
-   `decawave_dwm3001cdk_nrf52833.overlay.
+   `decawave_dwm3001cdk_nrf52833.overlay`.
 
    #### Returns:
     - `-ENODEV` if configuring DW3000 fails, 0 otherwise.
@@ -611,6 +611,9 @@ static int dw3000_wake_and_reinit()
     return 0;
 }
 
+/*
+   Puts a responder to sleep for a given `timeout_ms` using a given `timer`.
+*/
 static inline void dw3000_responder_sleep(struct k_timer* timer, int timeout_ms)
 {
     dwt_forcetrxoff();
