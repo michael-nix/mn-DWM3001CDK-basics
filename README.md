@@ -98,6 +98,7 @@ sequenceDiagram
                 Note over i: Add responder to responders list
             end
         end
+        Note over i,r: Sleep up to one second
     end
 ```
 
@@ -105,4 +106,4 @@ Initiators will attempt to pair with surrounding responders until it has paired 
 
 There is no persistence of state between power cycles for either initators or responders.  This means that if any device is unplugged or its reset button is pressed, it will forget the device that it's paired with.  Initiators will attempt to pair with all nearby devices again, and responders will respond to those messages.  Responders will only conduct range measurements with a paired initiator, and they can only be paired with one at a time.
 
-Alternatively, if an initiator is powered off for more than 2.5 seconds, any responder that expects a message from it will un-pair itself, and respond to any new pairing messages it hears.  Unplugging an initiator for a count of five is a good way to reset the state of devices, or to be able to swap out initiators.
+Alternatively, if an initiator is powered off for more than 2.5 seconds, any responder that expects a message from it will un-pair itself, and respond to any new pairing messages it hears.  Unplugging an initiator for a count of five is a good way to reset the state of devices, or to be able to swap out initiators.  Similarly, if a responder hasn't heard a message from its paired initiator, it will un-pair itself.
