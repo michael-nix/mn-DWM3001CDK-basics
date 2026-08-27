@@ -619,6 +619,19 @@ static inline void dw3000_responder_sleep(struct k_timer* timer, int timeout_ms)
     k_timer_start(timer, K_MSEC(timeout_ms), K_FOREVER);
 }
 
+/*
+   When a responder receives a range type message from an initiator, and the responder is paired
+   with that initiator, it records the reception time, determines and records a transmit time, and
+   then responds with both timestamps so the initiator can calculate a range.
+
+   #### Parameters:
+    - `responder_message` - a pointer to a `dw3000_msg_data` struct that will hold all the data that
+   needs to be updated and sent back to the initiator.
+
+   #### Returns:
+    - `-ETIMEDOUT` if the message times out when sending a reply,
+    - `0` otherwise.
+*/
 static int responder_range_reply(struct dw3000_msg_data* responder_message)
 {
     responder_message->msg_type = DW3000_RESP_RANGE_TYPE;
@@ -665,9 +678,15 @@ static int responder_range_reply(struct dw3000_msg_data* responder_message)
    messages from that initiator.
 
    #### Parameters:
-     - `responder_message` - a pointer to the container for message data to be sent to the
+    - `responder_message` - a pointer to the container for message data to be sent to the
    initiator,
-     - `paired_initiator_id` - a pointer to the ID of the initiator once paired with this responder.
+    - `paired_initiator_id` - a pointer to the ID of the initiator once paired with this responder.
+
+   #### Returns:
+    - `-ETIMEDOUT` if the responder times out waiting for the initiator to reply with an ACK,
+    - `-EBADMSG` if there's an error receiving the message,
+    - `-ENOMSG` if the initiator ACKs a different device or we receive the wrong message,
+    - `0` otherwise.
 */
 static int responder_pair_reply(
     struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id)
@@ -684,7 +703,7 @@ static int responder_pair_reply(
 
     uint32_t event = k_event_wait(&dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(10));
 
-    if ((event & DW3000_EVENT_TIMEOUT) != 0)
+    if (DW3000_EVENT_TIMEOUT == event)
     {
         LOG_WRN("<%s> Responder timeout when receiving ACK message from initiator!", __func__);
 
@@ -725,6 +744,20 @@ static int responder_pair_reply(
    For pairing messages, it replies right away, then waits to receive an ACK message from the
    initiator.  If the ACK is received, the initiator ID is recorded and the two devices are
    considered paired.  The responder will now respond to range requests.
+
+   #### Parameters:
+    - `responder_message` - a pointer to a `dw3000_msg_data` struct that contains the data that
+   needs to be sent to an initiator when ranging,
+    - `paired_initiator_id` - a pointer to the ID of the initiator that we did pair with and we need
+   to range with,
+    - `timer` - a pointer to a `k_timer` struct for putting the responder to sleep after a
+   successful message.
+
+   #### Returns:
+    - `-ETIMEDOUT` if the responder times out waiting for the initiator to reply with an ACK,
+    - `-EBADMSG` if there's an error receiving the message,
+    - `-ENOMSG` if the initiator ACKs a different device or we receive the wrong message type,
+    - `0` otherwise.
 */
 static int manage_responder_messages(
     struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id, struct k_timer* timer)
@@ -768,12 +801,26 @@ static int manage_responder_messages(
         LOG_DBG("<%s> DW3000 received wrong message! Got 0x%x from device: 0x%llx", __func__,
             rx_message.msg_type, rx_message.initiator_id);
 
-        error = -EBADMSG;
+        error = -ENOMSG;
     }
 
     return error;
 }
 
+/*
+   Send a range request message to a given initiator, wait 10 ms for a reply, and then calculate the
+   range given the timestamps returned by the responder.
+
+   #### Parameters:
+    - `initiator_message` - a poiner to a `dw3000_msg_data` struct that holds the data needed to
+   send to an initiator.
+
+   #### Returns:
+    - `-ETIMEDOUT` if the initiator times out waiting for a responder to reply,
+    - `-EBADMSG` if there's an error receiving a message,
+    - `-ENOMSG` if the initiator receives the wrong message,
+    - `0` otherwise.
+*/
 static int initiator_measure_range(struct dw3000_msg_data* initiator_message)
 {
     dwt_forcetrxoff();
@@ -784,7 +831,7 @@ static int initiator_measure_range(struct dw3000_msg_data* initiator_message)
 
     uint32_t event = k_event_wait(&dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(10));
 
-    if ((event & DW3000_EVENT_TIMEOUT) != 0)
+    if (DW3000_EVENT_TIMEOUT == event)
     {
         LOG_WRN("<%s> Didn't receive expected DW3000 ranging RX event in time!\n", __func__);
 
@@ -815,7 +862,7 @@ static int initiator_measure_range(struct dw3000_msg_data* initiator_message)
                 "%llx, got %llx",
             initiator_message->responder_id, rx_message.responder_id);
 
-        return -EBADMSG;
+        return -ENOMSG;
     }
 
     uint64_t tx_timestamp = 0;
@@ -851,15 +898,20 @@ static int initiator_measure_range(struct dw3000_msg_data* initiator_message)
     return 0;
 }
 
-// send a single pairing init message, and process all messages that come in
-// within ~100 ms; ack each one:
-// mark timestamp
-// send message
-// wait for a max of 100 ms
-// if message received, update timestamp
-// if timeout, break loop
-// otherwise record ID, send ack
-// update timestamp, keep waiting
+/*
+   Attempt to pair with any nearby responders.  For any that respond, add them to the responders
+   list.  Pair by sending out one message, and then wait for responders to randomly reply.
+   Immediately ACk each responder message.
+
+   #### Parameters:
+    - `initiator_message` - a pointer to a `dw3000_msg_data` struct containing the data needed to
+   pair with a responder,
+    - `responder_list` - a pointer to a list of responders already paired with, with space for more
+   to be paired with,
+    - `nresponders` - a pointer to the number of responders paired with so far,
+    - `ntimeouts` - a pointer to the number of times we've tried to pair but have timed out waiting
+   for replies.
+*/
 void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
     uint64_t* responder_list, uint8_t* nresponders, uint8_t* ntimeouts)
 {
@@ -886,10 +938,9 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
         event =
             k_event_wait(&dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(sleep_time_ms));
 
-        switch ((enum dw3000_event_type)event)
-        {
         // always send ACK, only update list if device not already in it:
-        case DW3000_RX_OK:
+        if ((event & DW3000_RX_OK) != 0)
+        {
             // send ack, re-enable RX, record ID
             struct dw3000_msg_data rx_message = {0};
             dwt_readrxdata((uint8_t*)&rx_message, DW_MSG_DATA_TXRX_LEN, 0);
@@ -936,28 +987,16 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
             LOG_INF("Adding device 0x%llx to responder list.", rx_message.responder_id);
             responder_list[ridx] = rx_message.responder_id;
             *nresponders += 1;
-
-            break;
-
-        case DW3000_RX_ERR:
+        }
+        else if ((event & DW3000_RX_ERR) != 0)
+        {
             LOG_WRN("Error receiving pairing message, re-enabling receiver.");
 
             dwt_forcetrxoff();
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
-            break;
-
-        case DW3000_EVENT_TIMEOUT:
-            break;
-
-        // impossible cases; added for compiler warnings.
-        case DW3000_LOST_CONTACT:
-        case DW3000_WAKE_UP:
-        case DW3000_TX_DONE:
-        case DW3000_TX_START:
-            break;
+            continue;
         }
-
     } while (DW3000_EVENT_TIMEOUT != event);
 
     // no new responders added, must have timed out without finding any:
@@ -974,7 +1013,8 @@ void initiator_pair_with_responders(struct dw3000_msg_data* initiator_message,
    Every second, for every responder recorded in its `responder_list`, the initiator sends a ranging
    message, and waits for a reply from the responder. If a message is received in time, it uses the
    original message transmit time, the responder's reply receive time, and the responder's time to
-   reply to calculate a distance between the initiator and responder.
+   reply to calculate a distance between the initiator and responder.  If there are too many errors
+   attempting to range with a responder, it's removed from the responders list.
 
    The initiator then tries to find unpaired responders by sending a pairing message, and waiting
    for respones for a maximum of 100 ms.  If it receives a response, it acknowledges the message,
@@ -1034,6 +1074,27 @@ void manage_initiator_messages(struct dw3000_msg_data* initiator_message)
     initiator_pair_with_responders(initiator_message, responder_list, &nresponders, &ntimeouts);
 }
 
+/*
+   Starts the main loop for a responder.
+
+   At this level, only initiators will ever receive `DW3000_TX_START` events, and only responders
+   will receive `DW3000_RX_OK`, `DW3000_RX_ERR`, or `DW3000_WAKE_UP` events (an intitiator doesn't
+   even have its receiver on at this point).  The `dw3000_events` object is re-used lower down so
+   that an initiator can immediately receive a message and handle it differently than a responder
+   would.  Timeouts when trying to receive a message are just errors.  Timeouts when waiting to
+   receive an event will let a responder pair with another initiator.  If a responder hasn't
+   received a good message from an initiator that was meant for it in too long it will unpair.
+
+   #### Parameters:
+    - `responder_message` - a pointer to a `dw3000_msg_data` struct that holds the data needed to
+   pair and range with an initiator,
+    - `paired_initiator_id` - a pointer to the 64-bit ID of an initiator that this responder is or
+   will be paired with,
+    - `timeout_timer` - a pointer to a `k_timer` struct that expires after a responder hasn't heard
+   from it's initiator in too long; unpairs,
+    - `sleep_timer` - a pointer to a `k_timer` struct that sets how long a responder should sleep
+   for.
+*/
 void start_responder(struct dw3000_msg_data* responder_message, uint64_t* paired_initiator_id,
     struct k_timer* timeout_timer, struct k_timer* sleep_timer)
 {
@@ -1080,7 +1141,7 @@ void start_responder(struct dw3000_msg_data* responder_message, uint64_t* paired
 
         // responders pair with an initiator; if it hasn't heard from it for a while, reset the
         // paired ID so that it will again respond to pairing messages from an initiator:
-        if (((event & DW3000_LOST_CONTACT) != 0) || ((event & DW3000_EVENT_TIMEOUT) != 0))
+        if (((event & DW3000_LOST_CONTACT) != 0) || (DW3000_EVENT_TIMEOUT == event))
         {
             *paired_initiator_id = 0;
             LOG_WRN("<%s> Lost contact or waiting for reception timed out; re-enabling receiver.",
@@ -1104,6 +1165,17 @@ void start_responder(struct dw3000_msg_data* responder_message, uint64_t* paired
     }
 }
 
+/*
+   Starts the main loop for an initiator.
+
+   Once per second, the initiator will try to range with any paired responders.  If there aren't
+   enough, or there are fewer than the max and it hasn't tried enough times yet, the initiator will
+   try to pair with nearby responders.  The initiator will then go to sleep.
+
+   #### Parameters:
+    - `tx_message` - a pointer to a `dw3000_msg_data` struct that holds all the data needed to send
+   to responders.
+*/
 void start_initiator(struct dw3000_msg_data* tx_message)
 {
     while (true)
@@ -1142,14 +1214,6 @@ void dw3000_thread(void* initiator, void* unused0, void* unused1)
 
     uint64_t paired_initiator_id = 0;
     struct k_timer dw3000_timer = {0};
-
-    // At this level, only initiators will ever receive `DW3000_TX_START` events, and only
-    // responders will receive `DW3000_RX_OK`, `DW3000_RX_ERR`, or `DW3000_WAKE_UP events (an
-    // intitiator doesn't even have its receiver on at this point).  The `dw3000_events` object is
-    // re-used lower down so that an initiator can immediately receive a message and handle it
-    // differently than a responder would.  Timeouts when trying to receive a message are just
-    // errors.  Timeouts when waiting to receive an event will let a responder pair with another
-    // initiator.
 
     // Start periodic transmission of initiator messages, or turn on the receiver for the responder:
     if (is_initiator)
