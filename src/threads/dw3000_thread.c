@@ -683,23 +683,19 @@ static int responder_pair_reply(
     dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 
     uint32_t event = k_event_wait(&dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(10));
-    switch ((enum dw3000_event_type)event)
+
+    if ((event & DW3000_EVENT_TIMEOUT) != 0)
     {
-    case DW3000_EVENT_TIMEOUT:
-    case DW3000_RX_ERR:
-        LOG_WRN("<%s> Error or timeout when receiving ACK message from initiator!", __func__);
+        LOG_WRN("<%s> Responder timeout when receiving ACK message from initiator!", __func__);
 
         return -ETIMEDOUT;
+    }
 
-    case DW3000_RX_OK:
-        break;
+    if ((event & DW3000_RX_ERR) != 0)
+    {
+        LOG_WRN("<%s> Responder error when receiving ACK message from initiator!", __func__);
 
-    // impossible cases; added for compiler warnings:
-    case DW3000_LOST_CONTACT:
-    case DW3000_WAKE_UP:
-    case DW3000_TX_DONE:
-    case DW3000_TX_START:
-        break;
+        return -EBADMSG;
     }
 
     struct dw3000_msg_data rx_message = {0};
@@ -710,7 +706,7 @@ static int responder_pair_reply(
     if (((uint8_t)DW3000_INIT_ACK_TYPE != rx_message.msg_type) ||
         (rx_message.responder_id != responder_message->responder_id))
     {
-        return -EBADMSG;
+        return -ENOMSG;
     }
 
     *paired_initiator_id = rx_message.initiator_id;
@@ -787,27 +783,19 @@ static int initiator_measure_range(struct dw3000_msg_data* initiator_message)
     dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 
     uint32_t event = k_event_wait(&dw3000_events, DW3000_RX_OK | DW3000_RX_ERR, true, K_MSEC(10));
-    switch ((enum dw3000_event_type)event)
+
+    if ((event & DW3000_EVENT_TIMEOUT) != 0)
     {
-    case DW3000_EVENT_TIMEOUT:
         LOG_WRN("<%s> Didn't receive expected DW3000 ranging RX event in time!\n", __func__);
 
         return -ETIMEDOUT;
+    }
 
-    case DW3000_RX_ERR:
+    if ((event & DW3000_RX_ERR) != 0)
+    {
         LOG_WRN("<%s> DW3000 initiator failed to receive a ranging message!\n", __func__);
 
         return -EBADMSG;
-
-    // impossible cases; added for compiler warnings:
-    case DW3000_LOST_CONTACT:
-    case DW3000_WAKE_UP:
-    case DW3000_TX_DONE:
-    case DW3000_TX_START:
-        break;
-
-    case DW3000_RX_OK:
-        break;
     }
 
     struct dw3000_msg_data rx_message = {0};
